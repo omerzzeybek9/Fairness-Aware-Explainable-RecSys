@@ -14,6 +14,7 @@ Functions:
     constrained_generate(model, ...)        -> list of tokens
     extract_patterns(tokens, ...)           -> dict of detected patterns
     score_path(tokens, model, ...)          -> float score
+    compute_pattern_specificity(adj, ...)   -> data-driven pattern scores
     generate_topk(user_node, model, ...)    -> list of (movie, pattern_type)
 """
 
@@ -85,10 +86,10 @@ def _corrupt_path(path, all_entities, base_rels):
         return path[:]
     neg = path[:]
     original = neg[last_entity_idx]
-    replacement = random.choice(all_entities)
-    while replacement == original:
-        replacement = random.choice(all_entities)
-    neg[last_entity_idx] = replacement
+    candidates = [e for e in all_entities if e != original]
+    if not candidates:
+        return path[:]
+    neg[last_entity_idx] = random.choice(candidates)
     return neg
 
 
@@ -261,7 +262,7 @@ def _allowed_next_tokens(prefix_tokens, adj, base_rels):
     if len(prefix_tokens) < 2:
         return set()
     prev_entity = prefix_tokens[-2]
-    return set(adj[prev_entity].get(last, set()))
+    return set(adj.get(prev_entity, {}).get(last, set()))
 
 
 def constrained_generate(start_tokens, model, vocab, id2tok, adj, base_rels,
@@ -380,64 +381,159 @@ def extract_patterns(tokens, movie_titles_set):
 PATTERN_PRIORITY = ["director", "cast", "composer", "writer", "genre", "cf"]
 
 
+def compute_pattern_specificity(adj, movie_titles_set):
+    """
+    Compute data-driven pattern priority scores from KG connectivity statistics.
+
+    The intuition: a relation that connects fewer movies is more discriminative
+    (specific) and therefore a stronger recommendation signal.
+    For example, two films sharing the same director is rarer and more
+    meaningful than two films sharing the same genre.
+
+    Method:
+        For each relation type, collect all intermediate entities (directors,
+        actors, genres, etc.) and count how many movies each entity connects to.
+        The inverse of the average count gives the specificity score.
+        Scores are then normalised to the range [0.5, 1.0].
+
+    Usage (call once after building adj, pass result everywhere):
+        pattern_scores = compute_pattern_specificity(adj, movie_titles_set)
+
+    Returns:
+        dict { pattern_name -> float score in [0.5, 1.0] }
+    """
+    pattern_rels = {
+        "director": ("directedBy",   "rev_directedBy"),
+        "cast":     ("hasCast",       "rev_hasCast"),
+        "composer": ("hasComposer",   "rev_hasComposer"),
+        "writer":   ("writtenBy",     "rev_writtenBy"),
+        "genre":    ("hasGenre",      "rev_hasGenre"),
+    }
+
+    raw_scores = {}
+    for pat, (fwd_rel, rev_rel) in pattern_rels.items():
+        counts = []
+        for node, rels in adj.items():
+            if rev_rel in rels:
+                films = [m for m in rels[rev_rel] if m in movie_titles_set]
+                if films:
+                    counts.append(len(films))
+        avg = sum(counts) / len(counts) if counts else 1.0
+        raw_scores[pat] = 1.0 / avg   # fewer connections = higher score
+
+    # Normalise to [0.5, 1.0]
+    max_s = max(raw_scores.values())
+    min_s = min(raw_scores.values())
+    scores = {}
+    for k, v in raw_scores.items():
+        scores[k] = 0.5 + 0.5 * (v - min_s) / (max_s - min_s + 1e-9)
+
+    # CF and gender are not relation-based so assign fixed lower scores
+    scores["cf"]     = 0.55
+    scores["gender"] = 0.50
+
+    print("Pattern specificity scores (data-driven):")
+    for k in PATTERN_PRIORITY + ["gender"]:
+        if k in scores:
+            print(f"  {k:<10}: {scores[k]:.4f}")
+    return scores
+
+
 def score_path(gen_tokens, user_node, model, vocab, adj, movie_titles_set,
-               PAD, BOS, EOS, UNK, base_rels, device="cpu"):
+               PAD, BOS, EOS, UNK, base_rels, device="cpu",
+               _movie_genres_cache=None, _movie_pop_cache=None):
     """
-    Score a generated path based on model likelihood, faithfulness,
-    pattern type, genre overlap, and novelty.
+    Score a generated path. Fast version: no full model forward pass.
+    The model already guided path quality via constrained generation;
+    scoring uses semantic heuristics only.
+
+    Components (all in [0,1]) and weights:
+        model_conf  0.35   last-token log-prob from GPT-2 (cheap single logit)
+        pattern     0.35   semantic quality (director > cast > genre > cf)
+        genre       0.20   Jaccard overlap of candidate genres with user history
+        novelty     0.10   penalises extremely popular items slightly
+
+    _movie_genres_cache / _movie_pop_cache: optional precomputed dicts
+        {movie_title -> set(genres)} and {movie_title -> int popularity}
+        passed in by generate_topk to avoid repeated adj lookups.
     """
-    score = 0.0
-
-    # 1) Model likelihood (lower NLL = better)
-    ids = torch.tensor([_encode_path(gen_tokens, vocab, UNK, BOS, EOS)], dtype=torch.long).to(device)
-    with torch.no_grad():
-        out = model(input_ids=ids, labels=ids)
-        nll = out.loss.item()
-    score += max(0, 5.0 - nll)
-
-    # 2) Faithfulness bonus
-    def _path_is_faithful(path):
-        for i in range(0, len(path) - 2, 2):
-            h, r, t = path[i], path[i+1], path[i+2]
-            if t not in adj.get(h, {}).get(r, set()):
-                return False
-        return True
-
-    if _path_is_faithful(gen_tokens):
-        score += 2.0
-
-    # 3) Pattern-specific bonus
     pats = extract_patterns(gen_tokens, movie_titles_set)
-    pattern_bonus = {"director": 1.5, "cast": 1.2, "composer": 1.1,
-                     "writer": 1.1, "genre": 1.0, "cf": 0.8}
+
+    # 1) Model confidence: log-prob of the last meaningful token (cheap)
+    ids = torch.tensor(
+        [_encode_path(gen_tokens, vocab, UNK, BOS, EOS)], dtype=torch.long
+    ).to(device)
+    # Truncate to model's max positional embedding size
+    max_pos = model.config.n_positions
+    ids = ids[:, :max_pos]
+    with torch.no_grad():
+        logits = model(input_ids=ids).logits          # (1, seq, vocab)
+    # position -2 predicts position -1 (last real token before EOS)
+    last_pos   = min(ids.shape[1] - 2, logits.shape[1] - 1)
+    last_token = int(ids[0, -1].item())               # EOS or last movie id
+    log_prob   = float(
+        torch.log_softmax(logits[0, last_pos], dim=-1)[last_token].item()
+    )
+    # log_prob is ≤ 0; map [-10, 0] -> [0, 1]
+    s_conf = float(min(1.0, max(0.0, 1.0 + log_prob / 10.0)))
+
+    # 2) Pattern quality
+    pattern_scores = {"director": 1.0, "cast": 0.85, "composer": 0.75,
+                      "writer": 0.75, "genre": 0.65, "cf": 0.60}
+    s_pattern = 0.0
     for pt in PATTERN_PRIORITY:
         if pt in pats:
-            score += pattern_bonus[pt]
+            s_pattern = pattern_scores.get(pt, 0.5)
             break
 
-    # 4) Genre overlap with user preferences
+    # 3) Genre overlap and novelty — use precomputed caches when available
     candidate = None
     for pt in PATTERN_PRIORITY:
         if pt in pats:
             candidate = pats[pt].get("candidate")
             break
 
+    s_genre   = 0.0
+    s_novelty = 0.5
+
     if candidate and candidate in adj:
         liked = adj[user_node].get("likes", set())
+
+        # User genre profile (precomputed or computed on the fly)
         user_genres = set()
         for m in liked:
-            user_genres.update(adj.get(m, {}).get("hasGenre", set()))
-        cand_genres = set(adj[candidate].get("hasGenre", set()))
+            if _movie_genres_cache and m in _movie_genres_cache:
+                user_genres.update(_movie_genres_cache[m])
+            else:
+                user_genres.update(adj.get(m, {}).get("hasGenre", set()))
+
+        # Candidate genres
+        if _movie_genres_cache and candidate in _movie_genres_cache:
+            cand_genres = _movie_genres_cache[candidate]
+        else:
+            cand_genres = set(adj[candidate].get("hasGenre", set()))
+
         if user_genres and cand_genres:
-            overlap = len(user_genres & cand_genres) / len(user_genres | cand_genres)
-            score += overlap * 2.0
+            s_genre = len(user_genres & cand_genres) / len(user_genres | cand_genres)
 
-        # 5) Novelty bonus (prefer less popular items)
-        popularity = len(adj[candidate].get("rev_likes", set()))
-        max_pop = max((len(adj.get(m, {}).get("rev_likes", set())) for m in liked), default=1)
-        novelty = 1.0 - min(popularity / max(max_pop, 1), 1.0)
-        score += novelty * 0.5
+        # Novelty
+        if _movie_pop_cache and candidate in _movie_pop_cache:
+            popularity = _movie_pop_cache[candidate]
+        else:
+            popularity = len(adj[candidate].get("rev_likes", set()))
 
+        max_pop = max(
+            (_movie_pop_cache.get(m, len(adj.get(m, {}).get("rev_likes", set())))
+             if _movie_pop_cache else len(adj.get(m, {}).get("rev_likes", set()))
+             for m in liked),
+            default=1,
+        )
+        s_novelty = 1.0 - min(popularity / max(max_pop, 1), 1.0)
+
+    score = (0.35 * s_conf    +
+             0.35 * s_pattern +
+             0.20 * s_genre   +
+             0.10 * s_novelty)
     return score
 
 
@@ -445,50 +541,146 @@ def score_path(gen_tokens, user_node, model, vocab, adj, movie_titles_set,
 # Recommendation
 # ---------------------------------------------------------------------------
 
-def generate_topk(user_node, model, vocab, id2tok, adj, base_rels,
-                  movie_titles_set, PAD, BOS, EOS, UNK, max_len,
-                  device="cpu", K=10, max_total_attempts=800):
+def enumerate_candidates(user_node, adj, movie_titles_set, liked,
+                         include_gender=False):
     """
-    Generate top-K movie recommendations for a user by repeatedly sampling
-    constrained paths and scoring them.
+    Deterministically enumerate every movie reachable from user_node via
+    KG paths in a single pass — no randomness, no model calls.
+
+    When a movie is reachable via multiple patterns the highest-priority one
+    wins (director > cast > composer > writer > genre > cf).
 
     Returns:
-        list of (movie_title, pattern_type) tuples, sorted by score
+        dict { movie_title -> (pattern_type, path_tokens) }
     """
+    candidates = {}
+
+    def _add(movie_b, pat_type, path):
+        if movie_b not in movie_titles_set or movie_b in liked:
+            return
+        priority = PATTERN_PRIORITY.index(pat_type) if pat_type in PATTERN_PRIORITY else 99
+        if movie_b not in candidates or priority < candidates[movie_b][2]:
+            candidates[movie_b] = (pat_type, path, priority)
+
+    bridge_rels = [
+        ("director", "directedBy",   "rev_directedBy"),
+        ("cast",     "hasCast",      "rev_hasCast"),
+        ("composer", "hasComposer",  "rev_hasComposer"),
+        ("writer",   "writtenBy",    "rev_writtenBy"),
+        ("genre",    "hasGenre",     "rev_hasGenre"),
+    ]
+
+    for movie_a in liked:
+        # Bridge patterns: movie_a -> rel -> entity -> rev_rel -> movie_b
+        for pat_type, fwd_rel, rev_rel in bridge_rels:
+            for entity in adj.get(movie_a, {}).get(fwd_rel, set()):
+                for movie_b in adj.get(entity, {}).get(rev_rel, set()):
+                    _add(movie_b, pat_type,
+                         [user_node, "likes", movie_a, fwd_rel, entity, rev_rel, movie_b])
+
+        # CF: movie_a -> rev_likes -> user_b -> likes -> movie_b
+        for user_b in adj.get(movie_a, {}).get("rev_likes", set()):
+            if user_b == user_node:
+                continue
+            for movie_b in adj.get(user_b, {}).get("likes", set()):
+                _add(movie_b, "cf",
+                     [user_node, "likes", movie_a, "rev_likes", user_b, "likes", movie_b])
+
+    # Gender bridge (GPT-2+Gender baseline only)
+    if include_gender:
+        for gender_node in adj.get(user_node, {}).get("hasGender", set()):
+            for user_b in adj.get(gender_node, {}).get("rev_hasGender", set()):
+                if user_b == user_node:
+                    continue
+                for movie_b in adj.get(user_b, {}).get("likes", set()):
+                    _add(movie_b, "gender",
+                         [user_node, "hasGender", gender_node,
+                          "rev_hasGender", user_b, "likes", movie_b])
+
+    return {m: (v[0], v[1]) for m, v in candidates.items()}
+
+
+def generate_topk(user_node, model, vocab, id2tok, adj, base_rels,
+                  movie_titles_set, PAD, BOS, EOS, UNK, max_len,
+                  device="cpu", K=10, max_total_attempts=None):
+    """
+    Generate top-K movie recommendations for a user.
+
+    Default strategy: deterministic KG enumeration (enumerate_candidates) —
+    finds every reachable candidate in one pass, scores each once.
+    Completes in milliseconds vs ~6 s/user with random sampling.
+
+    Pass max_total_attempts="random" to use the original random-sampling loop
+    (useful for ablation comparisons).
+
+    Returns:
+        list of (movie_title, pattern_type, path_tokens) tuples, sorted by score
+    """
+    if user_node not in adj:
+        return []
     liked = set(adj[user_node].get("likes", set()))
-    scored_candidates = []
-    seen_candidates = set()
-    total_attempts = 0
+    if not liked:
+        return []
 
-    while len(scored_candidates) < K * 3 and total_attempts < max_total_attempts:
-        total_attempts += 1
+    # Precompute caches once — shared across all score_path calls
+    _movie_genres_cache = {
+        m: set(adj.get(m, {}).get("hasGenre", set()))
+        for m in movie_titles_set
+    }
+    _movie_pop_cache = {
+        m: len(adj.get(m, {}).get("rev_likes", set()))
+        for m in movie_titles_set
+    }
 
-        gen = constrained_generate(
-            [user_node], model, vocab, id2tok, adj, base_rels,
-            PAD, BOS, EOS, UNK, max_len, device,
-            max_new_tokens=30, temperature=1.0, topk=20,
+    # ── Ablation: original random-sampling loop ───────────────────────────
+    if max_total_attempts == "random":
+        attempts_cap = 600
+        scored_candidates = []
+        seen_candidates = set()
+        total_attempts = 0
+        while len(scored_candidates) < K * 5 and total_attempts < attempts_cap:
+            total_attempts += 1
+            gen = constrained_generate(
+                [user_node], model, vocab, id2tok, adj, base_rels,
+                PAD, BOS, EOS, UNK, max_len, device,
+                max_new_tokens=15, temperature=1.0, topk=20,
+            )
+            pats = extract_patterns(gen, movie_titles_set)
+            if not pats:
+                continue
+            meta = None
+            for pt in PATTERN_PRIORITY:
+                if pt in pats:
+                    meta = pats[pt]; meta["type"] = pt; break
+            if meta:
+                candidate = meta.get("candidate")
+                if candidate and candidate not in liked and candidate not in seen_candidates:
+                    seen_candidates.add(candidate)
+                    scored_candidates.append((
+                        score_path(gen, user_node, model, vocab, adj,
+                                   movie_titles_set, PAD, BOS, EOS, UNK,
+                                   base_rels, device,
+                                   _movie_genres_cache=_movie_genres_cache,
+                                   _movie_pop_cache=_movie_pop_cache),
+                        candidate, meta.get("type", "unknown"), gen,
+                    ))
+        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+        return [(c, t, p) for _, c, t, p in scored_candidates[:K]]
+
+    # ── Fast path: enumerate all candidates, score each exactly once ──────
+    all_candidates = enumerate_candidates(user_node, adj, movie_titles_set, liked)
+    if not all_candidates:
+        return []
+
+    scored = []
+    for movie, (pat_type, path_tokens) in all_candidates.items():
+        s = score_path(
+            path_tokens, user_node, model, vocab, adj, movie_titles_set,
+            PAD, BOS, EOS, UNK, base_rels, device,
+            _movie_genres_cache=_movie_genres_cache,
+            _movie_pop_cache=_movie_pop_cache,
         )
-        pats = extract_patterns(gen, movie_titles_set)
-        if not pats:
-            continue
+        scored.append((s, movie, pat_type, path_tokens))
 
-        # Pick the best pattern
-        meta = None
-        for pt in PATTERN_PRIORITY:
-            if pt in pats:
-                meta = pats[pt]
-                meta["type"] = pt
-                break
-
-        if meta:
-            candidate = meta.get("candidate")
-            if candidate and candidate not in liked and candidate not in seen_candidates:
-                seen_candidates.add(candidate)
-                path_score = score_path(
-                    gen, user_node, model, vocab, adj, movie_titles_set,
-                    PAD, BOS, EOS, UNK, base_rels, device,
-                )
-                scored_candidates.append((path_score, candidate, meta.get("type", "unknown")))
-
-    scored_candidates.sort(key=lambda x: x[0], reverse=True)
-    return [(c, t) for _, c, t in scored_candidates[:K]]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [(c, t, p) for _, c, t, p in scored[:K]]

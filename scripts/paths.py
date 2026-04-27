@@ -6,12 +6,8 @@ Usage:
 """
 
 import random
-from collections import defaultdict
 
-BASE_RELS = {
-    "likes", "hasGenre", "directedBy", "year", "country",
-    "hasCast", "hasComposer", "writtenBy", "hasGender",
-}
+from kg_builder import BASE_RELS
 
 
 def is_relation(tok):

@@ -144,7 +144,7 @@ def train_test_split(positive_interactions, movies_sub, test_ratio=0.2):
     train_list, test_list = [], []
     for uid, group in interactions.groupby("userId"):
         n = len(group)
-        split_idx = int(n * 0.8)
+        split_idx = int(n * (1 - test_ratio))
         if split_idx == 0:
             split_idx = 1
         if split_idx >= n:

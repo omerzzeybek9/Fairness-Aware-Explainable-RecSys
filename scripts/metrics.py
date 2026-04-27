@@ -316,24 +316,30 @@ def generalized_cross_entropy(results, gender_map, k,
     """
     Generalized Cross Entropy (GCE) — Hellinger distance (α=0.5).
 
-    GCE(M, a) = (1 / α(1-α)) * [Σ_aj p_f^α(aj) * p^(1-α)(aj) - 1]
+    Measures divergence between observed per-group HR@K distribution and
+    the fair (equal HR) distribution. Uses per-user hit rates so the metric
+    is independent of group size, making it comparable across models.
 
-    With uniform fair distribution p_f = [0.5, 0.5] for binary groups.
-
-    Returns: gce (float), lower is fairer.
+    Returns: gce (float), lower is fairer (0 = perfectly fair HR across groups).
     """
-    # p(group) = fraction of total recommendations that went to each group
-    counts = {"M": 0, "F": 0}
+    hits = {"M": [], "F": []}
     for res in results:
         g = gender_map.get(res["user"])
         if g in ("M", "F"):
-            counts[g] += len(res["top_k_recs"][:k])
+            hit = 1.0 if set(res["top_k_recs"][:k]) & set(res["ground_truths"]) else 0.0
+            hits[g].append(hit)
 
-    total = counts["M"] + counts["F"]
-    if total == 0:
+    hr = {}
+    for g in ("M", "F"):
+        hr[g] = float(np.mean(hits[g])) if hits[g] else 0.0
+
+    total_hr = hr["M"] + hr["F"]
+    if total_hr == 0:
         return 0.0
 
-    p   = {g: counts[g] / total for g in ("M", "F")}
+    # Observed distribution over groups (by HR contribution)
+    p   = {g: hr[g] / total_hr for g in ("M", "F")}
+    # Fair distribution: equal HR share
     p_f = {"M": 0.5, "F": 0.5}
 
     inner = sum(
@@ -421,16 +427,26 @@ def demographic_parity(results, gender_map, k):
 
 def counterfactual_fairness_score(results, gender_map, adj, k):
     """
-    For each user u, find the most similar user of OPPOSITE gender by Jaccard
-    similarity of their training liked movies.
+    Counterfactual fairness via demographic-flip simulation.
 
-    Score = mean overlap fraction of top-K recs between u and its closest
-    opposite-gender neighbour.  Higher → more counterfactually fair.  Target > 0.5.
+    For each user u, we construct a counterfactual user u' that is identical
+    to u in every way except their gender node is swapped (M↔F).  We then
+    measure how much u's recommendations would change if the system "saw"
+    the opposite gender — using the overlap between:
+      - u's actual top-K recommendations
+      - top-K recommendations of the most taste-similar opposite-gender user
+
+    A high score means the model's recommendations are stable across gender
+    (i.e., gender doesn't drive the output) → fairer.
+
+    Score = 1 - mean_gender_sensitivity, where gender_sensitivity per user
+    is the fraction of their top-K recs that differ from their closest
+    opposite-gender twin.  Score closer to 1.0 = more counterfactually fair.
 
     Returns: (score, n_pairs)
     """
     result_lookup = {res["user"]: res["top_k_recs"] for res in results}
-    user_liked    = {res["user"]: frozenset(adj[res["user"]].get("likes", set()))
+    user_liked    = {res["user"]: frozenset(adj.get(res["user"], {}).get("likes", set()))
                      for res in results}
 
     male_users   = [r["user"] for r in results if gender_map.get(r["user"]) == "M"]
@@ -440,28 +456,34 @@ def counterfactual_fairness_score(results, gender_map, adj, k):
         u = a | b
         return len(a & b) / len(u) if u else 0.0
 
-    overlaps = []
+    sensitivities = []
     for res in results:
         u      = res["user"]
         gender = gender_map.get(u)
         if gender not in ("M", "F"):
             continue
-        pool     = female_users if gender == "M" else male_users
-        liked_u  = user_liked[u]
-        best_sim = -1.0
-        best_v   = None
+        pool    = female_users if gender == "M" else male_users
+        liked_u = user_liked[u]
+
+        # Find taste-closest opposite-gender user as counterfactual proxy
+        best_sim, best_v = -1.0, None
         for v in pool:
             sim = jaccard(liked_u, user_liked[v])
             if sim > best_sim:
                 best_sim, best_v = sim, v
         if best_v is None:
             continue
+
         recs_u = set(result_lookup[u][:k])
         recs_v = set(result_lookup[best_v][:k])
-        overlaps.append(len(recs_u & recs_v) / k if k > 0 else 0.0)
+        # Sensitivity = fraction of recs that differ when gender is flipped
+        sensitivity = 1.0 - (len(recs_u & recs_v) / k) if k > 0 else 0.0
+        sensitivities.append(sensitivity)
 
-    score = float(np.mean(overlaps)) if overlaps else 0.0
-    return score, len(overlaps)
+    # Score = 1 - mean_sensitivity  (higher = more stable = fairer)
+    mean_sensitivity = float(np.mean(sensitivities)) if sensitivities else 0.0
+    score = 1.0 - mean_sensitivity
+    return score, len(sensitivities)
 
 
 def print_additional_fairness_report(results, group_metrics, gender_map,

@@ -1,16 +1,22 @@
 """
 kg_builder.py — Knowledge Graph construction for movie recommendation.
 
-Pipeline:
+Wikidata pipeline (original):
     1. Search Wikidata for movie QIDs  (wikidata_search)
     2. Fetch film properties via SPARQL (get_film_properties)
     3. Resolve QID labels to human-readable names (get_label)
     4. Build adjacency graph from readable triples + user interactions (build_adj)
     5. Cache / load everything (load_or_build_kg)
 
-Main entry point:
-    load_or_build_kg(movies_sub, cache_path, ...)
-        → qid_map, label_cache, kg_triples, readable_triples
+IMDb pipeline (offline, no rate limits):
+    1. Load local TSV files from data/imdb/  (load_imdb_data)
+    2. Match movie titles to IMDb tconst IDs (match_movies_to_imdb)
+    3. Build readable triples directly       (build_kg_from_imdb)
+    4. Cache / load everything               (load_or_build_kg_imdb)
+
+Main entry points:
+    load_or_build_kg(movies_sub, cache_path, ...)       — Wikidata
+    load_or_build_kg_imdb(movies_sub, imdb_dir, ...)    — IMDb (recommended)
 
     build_adj(readable_triples, user_item_edges, user_info)
         → adj (defaultdict)
@@ -152,23 +158,67 @@ def get_film_properties(qid, sparql):
     return list(dict.fromkeys(triples))
 
 
-def fetch_kg_triples(qid_map, sleep_s=2.0):
+def fetch_kg_triples(qid_map, sleep_s=1.5, batch_size=20):
     """
     Fetch KG triples for all movies that have a QID.
+    Uses batched SPARQL queries (batch_size movies per query) to reduce
+    the number of round-trips to Wikidata from N → N/batch_size.
 
     Returns: list of (qid, relation, tail_qid) triples
     """
     sparql       = _init_sparql()
     kg_triples   = []
     movie_to_qid = {k: v for k, v in qid_map.items() if v is not None}
+    qids         = list(set(movie_to_qid.values()))   # unique QIDs only
 
-    for mid, qid in movie_to_qid.items():
+    batches = [qids[i:i+batch_size] for i in range(0, len(qids), batch_size)]
+    print(f"  Fetching {len(qids)} movies in {len(batches)} batches of {batch_size}...")
+
+    for b_idx, batch in enumerate(batches):
+        values_clause = " ".join(f"wd:{q}" for q in batch)
+        query = f"""
+        SELECT ?film ?genre ?director ?country ?cast ?composer ?screenwriter WHERE {{
+            VALUES ?film {{ {values_clause} }}
+            OPTIONAL {{ ?film wdt:P136 ?genre . }}
+            OPTIONAL {{ ?film wdt:P57  ?director . }}
+            OPTIONAL {{ ?film wdt:P495 ?country . }}
+            OPTIONAL {{ ?film wdt:P161 ?cast . }}
+            OPTIONAL {{ ?film wdt:P86  ?composer . }}
+            OPTIONAL {{ ?film wdt:P58  ?screenwriter . }}
+        }}
+        """
         try:
-            triples = get_film_properties(qid, sparql)
-            kg_triples.extend(triples)
-            print(f"  {mid} ({qid}): {len(triples)} triples")
+            sparql.setQuery(query)
+            results = sparql.query().convert()
+            batch_triples = []
+            for row in results["results"]["bindings"]:
+                film_qid = row["film"]["value"].split("/")[-1]
+                if "genre"        in row:
+                    batch_triples.append((film_qid, "hasGenre",    row["genre"]["value"].split("/")[-1]))
+                if "director"     in row:
+                    batch_triples.append((film_qid, "directedBy",  row["director"]["value"].split("/")[-1]))
+                if "country"      in row:
+                    batch_triples.append((film_qid, "country",     row["country"]["value"].split("/")[-1]))
+                if "cast"         in row:
+                    batch_triples.append((film_qid, "hasCast",     row["cast"]["value"].split("/")[-1]))
+                if "composer"     in row:
+                    batch_triples.append((film_qid, "hasComposer", row["composer"]["value"].split("/")[-1]))
+                if "screenwriter" in row:
+                    batch_triples.append((film_qid, "writtenBy",   row["screenwriter"]["value"].split("/")[-1]))
+            # Deduplicate within batch
+            batch_triples = list(dict.fromkeys(batch_triples))
+            kg_triples.extend(batch_triples)
+            print(f"  Batch {b_idx+1}/{len(batches)}: {len(batch_triples)} triples")
         except Exception as e:
-            print(f"  Error {mid} ({qid}): {e}")
+            print(f"  Batch {b_idx+1} error: {e} — retrying individually...")
+            # Fallback: fetch one by one for failed batch
+            for qid in batch:
+                try:
+                    triples = get_film_properties(qid, sparql)
+                    kg_triples.extend(triples)
+                except Exception as e2:
+                    print(f"    Skip {qid}: {e2}")
+                time.sleep(sleep_s)
         time.sleep(sleep_s)
 
     print(f"Total KG triples: {len(kg_triples)}")
@@ -179,8 +229,8 @@ def fetch_kg_triples(qid_map, sleep_s=2.0):
 
 def get_label(qid, label_cache):
     """
-    Resolve a Wikidata QID to its English label.
-    Updates label_cache in-place.
+    Resolve a single Wikidata QID to its English label.
+    Updates label_cache in-place. Used as a fallback for single lookups.
     """
     if qid in label_cache:
         return label_cache[qid]
@@ -197,6 +247,42 @@ def get_label(qid, label_cache):
         label_cache[qid] = qid
     time.sleep(0.1)
     return label_cache[qid]
+
+
+def get_labels_batch(qids, label_cache, batch_size=50):
+    """
+    Resolve multiple Wikidata QIDs to English labels in batches.
+    Uses the wbgetentities API endpoint (50 IDs per request).
+    Updates label_cache in-place.
+    """
+    missing = [q for q in qids if q not in label_cache and isinstance(q, str) and q.startswith("Q")]
+    if not missing:
+        return
+
+    batches = [missing[i:i+batch_size] for i in range(0, len(missing), batch_size)]
+    url     = "https://www.wikidata.org/w/api.php"
+    headers = {"User-Agent": "KGProject/1.0"}
+
+    for batch in batches:
+        params = {
+            "action":    "wbgetentities",
+            "ids":       "|".join(batch),
+            "props":     "labels",
+            "languages": "en",
+            "format":    "json",
+        }
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            for qid, ent in data.get("entities", {}).items():
+                label = ent.get("labels", {}).get("en", {}).get("value", qid)
+                label_cache[qid] = label
+        except Exception as e:
+            print(f"  Label batch error: {e} — falling back to single lookups")
+            for qid in batch:
+                get_label(qid, label_cache)
+        time.sleep(0.3)
 
 
 def build_readable_triples(kg_triples, movies_sub, label_cache=None):
@@ -218,11 +304,18 @@ def build_readable_triples(kg_triples, movies_sub, label_cache=None):
 
     qid_to_title = dict(zip(movies_sub["qid"], movies_sub["title"]))
 
+    # Batch-resolve all unknown tail QIDs before looping (50 per API call)
+    tail_qids = [t for _, _, t in kg_triples
+                 if isinstance(t, str) and t.startswith("Q") and t not in label_cache]
+    if tail_qids:
+        print(f"  Resolving {len(set(tail_qids))} unique QID labels in batches...")
+        get_labels_batch(list(set(tail_qids)), label_cache)
+
     readable_triples = []
     for h, r, t in kg_triples:
         h_label = qid_to_title.get(h, get_label(h, label_cache)) \
                   if isinstance(h, str) and h.startswith("Q") else h
-        t_label = get_label(t, label_cache) \
+        t_label = label_cache.get(t, t) \
                   if isinstance(t, str) and t.startswith("Q") else t
         readable_triples.append((h_label, r, t_label))
 
@@ -322,6 +415,10 @@ def load_or_build_kg(movies_sub, cache_path="kg_cache_v4.pkl"):
     """
     Load KG from cache if available, otherwise fetch from Wikidata and save.
 
+    Incremental update: if cache exists but some requested movies are missing,
+    only fetches the new movies and merges them into the existing cache.
+    This means going from 200 → 500 movies only fetches 300 new ones.
+
     Args:
         movies_sub  : DataFrame with ['movieId', 'title'] columns
         cache_path  : path to the pickle cache file
@@ -333,34 +430,354 @@ def load_or_build_kg(movies_sub, cache_path="kg_cache_v4.pkl"):
         readable_triples : list of (title, relation, label)
         movies_sub       : DataFrame (may have rows dropped if QID not found)
     """
+    needed_ids = set(movies_sub["movieId"].astype(int))
+
     if os.path.exists(cache_path):
         print(f"Loading KG from cache: {cache_path}")
         qid_map, label_cache, kg_triples, readable_triples = load_kg_cache(cache_path)
+        cached_ids = set(qid_map.keys())
+        missing_ids = needed_ids - cached_ids
+
+        if missing_ids:
+            print(f"  Cache has {len(cached_ids)} movies; "
+                  f"{len(missing_ids)} new movies need fetching...")
+
+            missing_df = movies_sub[movies_sub["movieId"].astype(int).isin(missing_ids)].copy()
+
+            # Step 1: QID lookup for new movies only
+            new_qid_map, new_movies_df = fetch_qid_map(missing_df)
+
+            # Step 2: Batch SPARQL for new movies only
+            new_kg_triples = fetch_kg_triples(new_qid_map)
+
+            # Step 3: Resolve labels (batch, reuses existing label_cache)
+            new_readable, label_cache = build_readable_triples(
+                new_kg_triples, new_movies_df, label_cache
+            )
+
+            # Merge into existing cache
+            qid_map.update(new_qid_map)
+            kg_triples.extend(new_kg_triples)
+
+            # Deduplicate readable_triples before merging
+            existing_set = set(readable_triples)
+            for t in new_readable:
+                if t not in existing_set:
+                    readable_triples.append(t)
+                    existing_set.add(t)
+
+            save_kg_cache(cache_path, qid_map, label_cache, kg_triples, readable_triples)
+            print(f"  Cache updated: now {len(qid_map)} movies, "
+                  f"{len(readable_triples)} readable triples.")
+        else:
+            print(f"  Cache fully covers requested {len(needed_ids)} movies.")
 
         movies_sub = movies_sub.copy()
-        movies_sub["qid"] = movies_sub["movieId"].map(qid_map)
+        movies_sub["qid"] = movies_sub["movieId"].astype(int).map(qid_map)
         movies_sub = movies_sub.dropna(subset=["qid"]).copy()
 
         print(f"  movies with QID: {len(movies_sub)}, "
               f"readable_triples: {len(readable_triples)}")
         return qid_map, label_cache, kg_triples, readable_triples, movies_sub
 
-    print(f"No cache found at '{cache_path}' — fetching from Wikidata.")
-    print(f"Estimated time: ~{len(movies_sub) * 2 // 60} min")
+    # ── No cache exists: full build ────────────────────────────────────────
+    n = len(movies_sub)
+    n_batches = (n + 19) // 20
+    print(f"No cache at '{cache_path}' — full build for {n} movies.")
+    print(f"  QID lookup:  ~{n * 0.4 / 60:.1f} min")
+    print(f"  SPARQL:      ~{n_batches * 1.5 / 60:.1f} min ({n_batches} batches of 20)")
+    print(f"  Labels:      ~{n // 50 * 0.3 / 60:.1f} min (batch API)")
 
-    # Step 1: QID lookup
     qid_map, movies_sub = fetch_qid_map(movies_sub)
-
-    # Step 2: SPARQL property fetch
     kg_triples = fetch_kg_triples(qid_map)
-
-    # Step 3: Label resolution + year triples
-    label_cache      = {}
+    label_cache = {}
     readable_triples, label_cache = build_readable_triples(
         kg_triples, movies_sub, label_cache
     )
-
-    # Step 4: Save
     save_kg_cache(cache_path, qid_map, label_cache, kg_triples, readable_triples)
 
     return qid_map, label_cache, kg_triples, readable_triples, movies_sub
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# IMDb Pipeline (offline — no API calls, no rate limits)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def load_imdb_data(imdb_dir="data/imdb"):
+    """
+    Load the four IMDb TSV files into memory.
+
+    Required files in imdb_dir:
+        title.basics.tsv, title.crew.tsv,
+        title.principals.tsv, name.basics.tsv
+
+    Returns:
+        basics_df     : DataFrame (movies only)
+        crew_df       : DataFrame
+        principals_df : DataFrame
+        names_dict    : dict {nconst -> primaryName}
+    """
+    import pandas as pd
+
+    print("Loading IMDb datasets...")
+
+    basics_df = pd.read_csv(
+        os.path.join(imdb_dir, "title.basics.tsv"),
+        sep="\t", na_values=r"\N", dtype=str, low_memory=False,
+        usecols=["tconst", "titleType", "primaryTitle",
+                 "originalTitle", "startYear", "genres"],
+    )
+    basics_df = basics_df[basics_df["titleType"].isin(["movie", "tvMovie"])].copy()
+    basics_df["startYear"] = pd.to_numeric(basics_df["startYear"], errors="coerce")
+
+    crew_df = pd.read_csv(
+        os.path.join(imdb_dir, "title.crew.tsv"),
+        sep="\t", na_values=r"\N", dtype=str,
+    )
+
+    principals_df = pd.read_csv(
+        os.path.join(imdb_dir, "title.principals.tsv"),
+        sep="\t", na_values=r"\N", dtype=str, low_memory=False,
+        usecols=["tconst", "ordering", "nconst", "category"],
+    )
+    principals_df["ordering"] = pd.to_numeric(
+        principals_df["ordering"], errors="coerce"
+    )
+
+    names_df = pd.read_csv(
+        os.path.join(imdb_dir, "name.basics.tsv"),
+        sep="\t", na_values=r"\N", dtype=str, low_memory=False,
+        usecols=["nconst", "primaryName"],
+    )
+    names_dict = dict(zip(names_df["nconst"], names_df["primaryName"]))
+
+    print(f"  IMDb movies:       {len(basics_df):,}")
+    print(f"  Crew entries:      {len(crew_df):,}")
+    print(f"  Principal entries: {len(principals_df):,}")
+    print(f"  Person names:      {len(names_dict):,}")
+
+    return basics_df, crew_df, principals_df, names_dict
+
+
+def match_movies_to_imdb(movies_sub, basics_df):
+    """
+    Match ML-100K/1M movie titles (e.g. "Toy Story (1995)") to IMDb tconst IDs.
+
+    Matching strategy (in order of priority):
+        1. primaryTitle + year   (exact, case-insensitive)
+        2. originalTitle + year
+        3. primaryTitle only     (no year — last resort)
+
+    Returns:
+        tconst_map : dict {movieId (int) -> tconst str or None}
+    """
+    import pandas as pd
+
+    basics_idx = basics_df.copy()
+    basics_idx["norm_primary"]  = basics_idx["primaryTitle"].str.lower().str.strip()
+    basics_idx["norm_original"] = basics_idx["originalTitle"].fillna("").str.lower().str.strip()
+
+    primary_year_map  = {}
+    original_year_map = {}
+    primary_only_map  = {}
+
+    for _, row in basics_idx.iterrows():
+        tc = row["tconst"]
+        pt = row["norm_primary"]
+        ot = row["norm_original"]
+        yr = row["startYear"]
+
+        key_py = (pt, yr)
+        key_oy = (ot, yr)
+
+        if key_py not in primary_year_map:
+            primary_year_map[key_py] = tc
+        if ot and key_oy not in original_year_map:
+            original_year_map[key_oy] = tc
+        if pt not in primary_only_map:
+            primary_only_map[pt] = tc
+
+    tconst_map = {}
+    matched = 0
+
+    for _, row in movies_sub.iterrows():
+        mid   = int(row["movieId"])
+        title = row["title"]
+
+        yr_m  = re.search(r"\((\d{4})\)\s*$", title)
+        year  = float(yr_m.group(1)) if yr_m else float("nan")
+        clean = re.sub(r"\s*\(\d{4}\)\s*$", "", title).strip().lower()
+
+        tconst = (
+            primary_year_map.get((clean, year))
+            or original_year_map.get((clean, year))
+            or primary_only_map.get(clean)
+        )
+
+        tconst_map[mid] = tconst
+        if tconst:
+            matched += 1
+
+    total = len(movies_sub)
+    print(f"IMDb match: {matched}/{total} movies ({matched/total*100:.1f}%)")
+    return tconst_map
+
+
+def build_kg_from_imdb(movies_sub, tconst_map, basics_df, crew_df,
+                        principals_df, names_dict, max_cast=5):
+    """
+    Build human-readable KG triples directly from IMDb local data.
+    No QID step — names are resolved immediately via names_dict.
+
+    Relations produced: hasGenre, directedBy, writtenBy, hasCast, hasComposer, year
+
+    Args:
+        max_cast : max top-billed actors per movie (ordering <= max_cast)
+
+    Returns:
+        readable_triples : list of (movie_title, relation, entity_name)
+    """
+    import pandas as pd
+
+    mid_to_title    = dict(zip(movies_sub["movieId"].astype(int), movies_sub["title"]))
+    mid_to_tconst   = {mid: tc for mid, tc in tconst_map.items() if tc is not None}
+    tconst_to_title = {tc: mid_to_title[mid] for mid, tc in mid_to_tconst.items()}
+    valid_tconsts   = set(tconst_to_title)
+
+    basics_f     = basics_df[basics_df["tconst"].isin(valid_tconsts)]
+    crew_f       = crew_df[crew_df["tconst"].isin(valid_tconsts)]
+    principals_f = principals_df[principals_df["tconst"].isin(valid_tconsts)]
+
+    readable_triples = []
+
+    # Genre triples
+    for _, row in basics_f.iterrows():
+        title = tconst_to_title.get(row["tconst"])
+        if not title or pd.isna(row.get("genres")):
+            continue
+        for genre in str(row["genres"]).split(","):
+            genre = genre.strip()
+            if genre:
+                readable_triples.append((title, "hasGenre", genre))
+
+    # Director and writer triples (crew file — all directors/writers)
+    for _, row in crew_f.iterrows():
+        title = tconst_to_title.get(row["tconst"])
+        if not title:
+            continue
+        if pd.notna(row.get("directors")):
+            for nconst in str(row["directors"]).split(","):
+                name = names_dict.get(nconst.strip())
+                if name:
+                    readable_triples.append((title, "directedBy", name))
+        if pd.notna(row.get("writers")):
+            for nconst in str(row["writers"]).split(","):
+                name = names_dict.get(nconst.strip())
+                if name:
+                    readable_triples.append((title, "writtenBy", name))
+
+    # Cast (top max_cast billed) and composer triples (principals file)
+    cat_to_rel = {"actor": "hasCast", "actress": "hasCast", "composer": "hasComposer"}
+    for _, row in principals_f.iterrows():
+        cat = row.get("category")
+        rel = cat_to_rel.get(cat)
+        if not rel:
+            continue
+        # Limit actors/actresses to top billing; keep all composers
+        if rel == "hasCast" and (pd.isna(row["ordering"]) or row["ordering"] > max_cast):
+            continue
+        title = tconst_to_title.get(row["tconst"])
+        name  = names_dict.get(row.get("nconst"))
+        if title and name:
+            readable_triples.append((title, rel, name))
+
+    # Year triples from title strings
+    for _, row in movies_sub.iterrows():
+        m = re.search(r"\((\d{4})\)", row["title"])
+        if m:
+            readable_triples.append((row["title"], "year", m.group(1)))
+
+    readable_triples = list(dict.fromkeys(readable_triples))
+
+    rel_counts = Counter(r for _, r, _ in readable_triples)
+    print(f"IMDb KG — {len(readable_triples)} readable triples:")
+    for rel, cnt in rel_counts.most_common():
+        print(f"  {rel}: {cnt}")
+
+    return readable_triples
+
+
+def load_or_build_kg_imdb(movies_sub, imdb_dir="data/imdb",
+                           cache_path="kg_cache_imdb.pkl", max_cast=5):
+    """
+    Build the KG from local IMDb TSV files (no network calls, no rate limits).
+
+    Incremental: if the cache already exists and only some movies are new,
+    only those new movies are processed and merged in.
+
+    Return signature matches load_or_build_kg so the notebook needs no
+    structural changes. The 'qid_map' field stores movieId -> tconst.
+
+    Args:
+        movies_sub : DataFrame with ['movieId', 'title'] columns
+        imdb_dir   : directory containing the four IMDb TSV files
+        cache_path : path to the pickle cache file
+        max_cast   : max top-billed actors per movie
+    """
+    needed_ids = set(movies_sub["movieId"].astype(int))
+
+    if os.path.exists(cache_path):
+        print(f"Loading KG from cache: {cache_path}")
+        tconst_map, _, _, readable_triples = load_kg_cache(cache_path)
+        cached_ids  = set(tconst_map.keys())
+        missing_ids = needed_ids - cached_ids
+
+        if not missing_ids:
+            print(f"  Cache fully covers requested {len(needed_ids)} movies.")
+        else:
+            print(f"  {len(missing_ids)} new movies need processing...")
+            missing_df = movies_sub[
+                movies_sub["movieId"].astype(int).isin(missing_ids)
+            ].copy()
+
+            basics_df, crew_df, principals_df, names_dict = load_imdb_data(imdb_dir)
+            new_tconst_map = match_movies_to_imdb(missing_df, basics_df)
+            new_readable   = build_kg_from_imdb(
+                missing_df, new_tconst_map,
+                basics_df, crew_df, principals_df, names_dict, max_cast,
+            )
+
+            tconst_map.update(new_tconst_map)
+            existing_set = set(map(tuple, readable_triples))
+            for t in new_readable:
+                if tuple(t) not in existing_set:
+                    readable_triples.append(t)
+                    existing_set.add(tuple(t))
+
+            save_kg_cache(cache_path, tconst_map, {}, [], readable_triples)
+            print(f"  Cache updated: {len(tconst_map)} movies, "
+                  f"{len(readable_triples)} triples.")
+
+        movies_out = movies_sub.copy()
+        movies_out["qid"] = movies_out["movieId"].astype(int).map(tconst_map)
+        movies_out = movies_out.dropna(subset=["qid"]).copy()
+        print(f"  movies with tconst: {len(movies_out)}, "
+              f"readable_triples: {len(readable_triples)}")
+        return tconst_map, {}, [], readable_triples, movies_out
+
+    # ── No cache: full build ───────────────────────────────────────────────
+    print(f"No cache at '{cache_path}' — full IMDb build for {len(movies_sub)} movies.")
+    basics_df, crew_df, principals_df, names_dict = load_imdb_data(imdb_dir)
+    tconst_map       = match_movies_to_imdb(movies_sub, basics_df)
+    readable_triples = build_kg_from_imdb(
+        movies_sub, tconst_map,
+        basics_df, crew_df, principals_df, names_dict, max_cast,
+    )
+    save_kg_cache(cache_path, tconst_map, {}, [], readable_triples)
+
+    movies_out = movies_sub.copy()
+    movies_out["qid"] = movies_out["movieId"].astype(int).map(tconst_map)
+    movies_out = movies_out.dropna(subset=["qid"]).copy()
+    print(f"  movies with tconst: {len(movies_out)}, "
+          f"readable_triples: {len(readable_triples)}")
+    return tconst_map, {}, [], readable_triples, movies_out

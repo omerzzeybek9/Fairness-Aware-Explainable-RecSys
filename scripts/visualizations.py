@@ -7,10 +7,8 @@ Usage (in notebook):
     importlib.reload(viz)
 
     models = {
-        "GPT-2 (Ours)":   (results,            ranking_metrics,            group_metrics),
-        "Random":          (results_random,      ranking_metrics_random,     group_metrics_random),
-        "Popularity":      (results_popularity,  ranking_metrics_popularity, group_metrics_popularity),
-        "GPT-2 + Gender":  (results_gender,      ranking_metrics_gender,     group_metrics_gender),
+        "GPT-2 (Ours)": (results,        ranking_metrics,        group_metrics),
+        "GPT-2+Gender": (results_gender,  ranking_metrics_gender, group_metrics_gender),
     }
 
     viz.plot_all(models, k_values=K_VALUES, save_dir="figures")
@@ -26,9 +24,7 @@ from metrics import evaluate_ranking, disparate_impact
 
 MODEL_COLORS = {
     "GPT-2 (Ours)":  "#2ecc71",
-    "Random":        "#95a5a6",
-    "Popularity":    "#3498db",
-    "GPT-2 + Gender":"#e74c3c",
+    "GPT-2+Gender":  "#e74c3c",
 }
 
 GENDER_COLORS = {"M": "#3498db", "F": "#e74c3c"}
@@ -48,7 +44,8 @@ plt.rcParams.update({
 # Public entry point
 # ══════════════════════════════════════════════════════════════════════════════
 
-def plot_all(models, k_values=(1, 3, 5, 10), save_dir="figures"):
+def plot_all(models, k_values=(1, 3, 5, 10), save_dir="figures",
+             ilap_scores=None, fairness_scores=None):
     """
     Generate all comparison plots and save to save_dir.
 
@@ -58,8 +55,10 @@ def plot_all(models, k_values=(1, 3, 5, 10), save_dir="figures"):
         {model_label: (results_list, ranking_metrics_dict, group_metrics_dict)}
         ranking_metrics_dict  = evaluate_ranking(results, k_values)
         group_metrics_dict    = compute_group_metrics(results, user_gender_map, k_values)
-    k_values : tuple
-    save_dir : str  folder to save figures (created if missing)
+    k_values     : tuple
+    save_dir     : str   folder to save figures (created if missing)
+    ilap_scores     : dict  optional {model_label: ilap_dict}
+    fairness_scores : dict  optional {model_label: {"DI","EO","DP","CF"}}
     """
     os.makedirs(save_dir, exist_ok=True)
 
@@ -68,6 +67,11 @@ def plot_all(models, k_values=(1, 3, 5, 10), save_dir="figures"):
     _plot_gender_breakdown(models, k=10, save_dir=save_dir)
     _plot_fairness_gap(models, k_values, save_dir=save_dir)
     _plot_hr_k_lines(models, k_values, save_dir=save_dir)
+    if ilap_scores:
+        _plot_ilap_comparison(ilap_scores, save_dir=save_dir)
+    if fairness_scores:
+        _plot_fairness_metrics(fairness_scores, save_dir=save_dir)
+        _plot_fairness_heatmap(fairness_scores, ilap_scores, save_dir=save_dir)
 
     print(f"All figures saved to '{save_dir}/'")
 
@@ -270,3 +274,161 @@ def _plot_hr_k_lines(models, k_values, save_dir):
     plt.savefig(path, bbox_inches="tight", dpi=300)
     plt.show()
     print(f"  Saved: {path}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Figure 6 — ILAP fairness metrics bar chart across all models
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _plot_ilap_comparison(ilap_scores, save_dir):
+    """Bar chart comparing key ILAP fairness metrics across all models."""
+    ilap_keys = ["DF", "VU", "AU", "NU", "GCE"]
+    labels = list(ilap_scores.keys())
+    colors = [MODEL_COLORS.get(l, f"C{i}") for i, l in enumerate(labels)]
+
+    n_metrics = len(ilap_keys)
+    x = np.arange(n_metrics)
+    n_models = len(labels)
+    bar_w = 0.7 / n_models
+
+    fig, ax = plt.subplots(figsize=(13, 5))
+    fig.suptitle("ILAP Fairness Metrics — All Models (lower = fairer)",
+                 fontsize=14, fontweight="bold")
+
+    for idx, label in enumerate(labels):
+        ilap = ilap_scores[label]
+        vals = [abs(ilap.get(k, 0)) for k in ilap_keys]
+        offset = (idx - n_models / 2 + 0.5) * bar_w
+        bars = ax.bar(x + offset, vals, bar_w,
+                      label=label,
+                      color=MODEL_COLORS.get(label, f"C{idx}"),
+                      alpha=0.88, edgecolor="white", linewidth=0.5)
+        for bar in bars:
+            h = bar.get_height()
+            if h > 0.001:
+                ax.text(bar.get_x() + bar.get_width() / 2, h + 0.001,
+                        f"{h:.3f}", ha="center", va="bottom", fontsize=7)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(ilap_keys)
+    ax.set_ylabel("Absolute value (lower = fairer)")
+    ax.legend(fontsize=9)
+    ax.set_ylim(0, ax.get_ylim()[1] * 1.2)
+
+    plt.tight_layout()
+    path = os.path.join(save_dir, "fig6_ilap_comparison.png")
+    plt.savefig(path, bbox_inches="tight", dpi=300)
+    plt.show()
+    print(f"  Saved: {path}")
+
+# =============================================================================
+# Figure 7 — DI / EO / DP / CF bar chart across all models
+# =============================================================================
+
+def _plot_fairness_metrics(fairness_scores, save_dir):
+    metrics_def = [
+        ("Disparate Impact",        "DI",  0.8,  ">=0.8 = fair"),
+        ("Equalized Opportunity",   "EO",  None, "lower = fairer"),
+        ("Demographic Parity",      "DP",  None, "lower = fairer"),
+        ("Counterfactual Fairness", "CF",  None, "higher = fairer"),
+    ]
+    labels = list(fairness_scores.keys())
+    colors = [MODEL_COLORS.get(l, "C{}".format(i)) for i, l in enumerate(labels)]
+
+    fig, axes = plt.subplots(1, 4, figsize=(18, 5))
+    fig.suptitle("Fairness Metrics Comparison — All Models", fontsize=14, fontweight="bold")
+
+    for ax, (title, key, threshold, note) in zip(axes, metrics_def):
+        vals = [fairness_scores[l].get(key, 0) for l in labels]
+        bars = ax.bar(labels, vals, color=colors, alpha=0.88, edgecolor="white", linewidth=0.5)
+        if threshold is not None:
+            ax.axhline(threshold, color="#e67e22", linestyle="--", linewidth=1.5,
+                       label="Threshold ({})".format(threshold))
+            ax.legend(fontsize=8)
+        for bar, v in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    v + max(vals) * 0.02 if max(vals) > 0 else 0.02,
+                    "{:.3f}".format(v), ha="center", va="bottom", fontsize=8.5)
+        ax.set_title("{}\n({})".format(title, note), fontsize=10)
+        ax.set_ylabel(key)
+        ax.set_ylim(0, max(vals) * 1.3 if max(vals) > 0 else 1)
+        ax.tick_params(axis="x", rotation=15)
+
+    plt.tight_layout()
+    path = os.path.join(save_dir, "fig7_fairness_metrics.png")
+    plt.savefig(path, bbox_inches="tight", dpi=300)
+    plt.show()
+    print("  Saved: {}".format(path))
+
+
+# =============================================================================
+# Figure 8 — Fairness heatmap: all metrics x all models
+# =============================================================================
+
+def _plot_fairness_heatmap(fairness_scores, ilap_scores, save_dir):
+    labels = list(fairness_scores.keys())
+
+    row_defs = [
+        ("Disparate Impact",        "DI",  "fair", True),
+        ("Equalized Opportunity",   "EO",  "fair", False),
+        ("Demographic Parity",      "DP",  "fair", False),
+        ("Counterfactual Fairness", "CF",  "fair", True),
+        ("Diff. Fairness (DF)",     "DF",  "ilap", False),
+        ("Value Unfairness (VU)",   "VU",  "ilap", False),
+        ("Abs. Unfairness (AU)",    "AU",  "ilap", False),
+        ("Non-Parity (NU)",         "NU",  "ilap", False),
+        ("KL Divergence (GCE)",     "GCE", "ilap", False),
+    ]
+    if ilap_scores is None:
+        row_defs = [r for r in row_defs if r[2] == "fair"]
+
+    matrix, row_labels, hib_flags = [], [], []
+    for display, key, source, hib in row_defs:
+        row = []
+        for label in labels:
+            if source == "fair":
+                row.append(fairness_scores.get(label, {}).get(key, 0))
+            else:
+                row.append(abs(ilap_scores.get(label, {}).get(key, 0)))
+        matrix.append(row)
+        row_labels.append(display)
+        hib_flags.append(hib)
+
+    matrix = np.array(matrix, dtype=float)
+    norm_matrix = np.zeros_like(matrix)
+    for i, hib in enumerate(hib_flags):
+        row = matrix[i]
+        mn, mx = row.min(), row.max()
+        if mx > mn:
+            nr = (row - mn) / (mx - mn)
+            norm_matrix[i] = nr if hib else 1 - nr
+        else:
+            norm_matrix[i] = 0.5
+
+    fig, (ax_heat, ax_vals) = plt.subplots(
+        1, 2, figsize=(14, 6), gridspec_kw={"width_ratios": [3, 2]}
+    )
+    fig.suptitle("Fairness Metrics Heatmap — All Models", fontsize=14, fontweight="bold")
+
+    im = ax_heat.imshow(norm_matrix, cmap="RdYlGn", vmin=0, vmax=1, aspect="auto")
+    ax_heat.set_xticks(range(len(labels)))
+    ax_heat.set_xticklabels(labels, rotation=15, ha="right")
+    ax_heat.set_yticks(range(len(row_labels)))
+    ax_heat.set_yticklabels(row_labels)
+    ax_heat.set_title("Relative fairness (green = better)", fontsize=10)
+    plt.colorbar(im, ax=ax_heat, fraction=0.03)
+
+    ax_vals.axis("off")
+    table_data = [["{:.4f}".format(matrix[r, c]) for c in range(len(labels))]
+                  for r in range(len(row_labels))]
+    tbl = ax_vals.table(cellText=table_data, rowLabels=row_labels,
+                        colLabels=labels, cellLoc="center", loc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(8)
+    tbl.scale(1.2, 1.4)
+    ax_vals.set_title("Raw values", fontsize=10)
+
+    plt.tight_layout()
+    path = os.path.join(save_dir, "fig8_fairness_heatmap.png")
+    plt.savefig(path, bbox_inches="tight", dpi=300)
+    plt.show()
+    print("  Saved: {}".format(path))
