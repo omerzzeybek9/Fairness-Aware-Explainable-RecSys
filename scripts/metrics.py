@@ -1,26 +1,9 @@
-"""
-metrics.py — Evaluation metrics for KG-based fair recommendation.
-
-Sections:
-    1. Standard ranking metrics      — HR@K, MRR@K, NDCG@K
-    2. Group evaluation              — per-gender metric breakdown
-    3. ILAP fairness metrics         — DF, VU, AU, UU, OU, NU, KS, GCE
-    4. Additional fairness metrics   — HR gap, Demographic Parity,
-                                       Counterfactual Fairness
-    5. Path fairness metrics         — path type distribution, cross-genre access,
-                                       path length fairness, path score KS
-"""
-
 import math
 from collections import Counter, defaultdict
 
 import numpy as np
 from scipy import stats as scipy_stats
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 1. Standard Ranking Metrics
-# ══════════════════════════════════════════════════════════════════════════════
 
 def hit_at_k(ranked_list, ground_truths, k):
     return 1.0 if set(ranked_list[:k]) & set(ground_truths) else 0.0
@@ -44,16 +27,6 @@ def ndcg_at_k(ranked_list, ground_truths, k):
 
 
 def evaluate_ranking(results, k_values=(1, 3, 5, 10)):
-    """
-    Compute HR, MRR, NDCG at multiple K values.
-
-    Args:
-        results: list of dicts with keys 'top_k_recs' and 'ground_truths'
-        k_values: iterable of K values
-
-    Returns:
-        dict {k: {'HR': float, 'MRR': float, 'NDCG': float}}
-    """
     scores = {k: {"HR": [], "MRR": [], "NDCG": []} for k in k_values}
     for res in results:
         ranked, gt = res["top_k_recs"], res["ground_truths"]
@@ -66,17 +39,7 @@ def evaluate_ranking(results, k_values=(1, 3, 5, 10)):
             for k in k_values}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 2. Group Evaluation (per gender)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def build_user_gender_map(users_df):
-    """
-    Build a mapping from 'User_<id>' node string to 'M' or 'F'.
-
-    Args:
-        users_df: DataFrame with columns ['userId', 'gender']
-    """
     mapping = {}
     for _, row in users_df.iterrows():
         g = row["gender"]
@@ -86,12 +49,6 @@ def build_user_gender_map(users_df):
 
 
 def compute_group_metrics(results, gender_map, k_values=(1, 3, 5, 10)):
-    """
-    Per-gender HR@K, MRR@K, NDCG@K.
-
-    Returns:
-        dict {gender: {k: {'HR', 'MRR', 'NDCG', 'n'}}}
-    """
     scores = {g: {k: {"HR": [], "MRR": [], "NDCG": []}
                   for k in k_values} for g in ("M", "F")}
 
@@ -119,34 +76,8 @@ def compute_group_metrics(results, gender_map, k_values=(1, 3, 5, 10)):
     return out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 3. ILAP Fairness Metrics
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# Notation (shared across all ILAP metrics):
-#   g   = disadvantaged group (default: Female)
-#   ¬g  = advantaged group    (default: Male)
-#   y_j = avg predicted score for item j from group
-#   r_j = avg actual relevance for item j from group
-#
-# For a top-K recommender:
-#   predicted score  = 1 if item appears in user's top-K list, else 0
-#   actual relevance = 1 if item is in user's test ground truth, else 0
-
-
 def _build_item_score_tables(results, gender_map, k,
                               disadv="F", adv="M"):
-    """
-    For every item that appears in any user's top-K or ground truth,
-    compute per-group average predicted score (y) and actual relevance (r).
-
-    Returns:
-        items        : sorted list of all items
-        y_disadv     : dict[item → avg predicted score, disadvantaged group]
-        y_adv        : dict[item → avg predicted score, advantaged group]
-        r_disadv     : dict[item → avg actual relevance, disadvantaged group]
-        r_adv        : dict[item → avg actual relevance, advantaged group]
-    """
     pred   = {disadv: defaultdict(list), adv: defaultdict(list)}
     actual = {disadv: defaultdict(list), adv: defaultdict(list)}
 
@@ -234,14 +165,6 @@ def differential_fairness(results, gender_map, k, disadv="F", adv="M", alpha=1.0
 
 
 def value_unfairness(results, gender_map, k, disadv="F", adv="M"):
-    """
-    Value Unfairness (VU).
-
-    Uval = (1/n) Σ_j |(y_d_j - r_d_j) - (y_a_j - r_a_j)|
-
-    Matches ILAP reference: mean of absolute per-item differences.
-    Zero = fair; higher = more unfair.
-    """
     items, y_d, y_a, r_d, r_a = _build_item_score_tables(
         results, gender_map, k, disadv, adv)
     if not items:
@@ -251,14 +174,6 @@ def value_unfairness(results, gender_map, k, disadv="F", adv="M"):
 
 
 def absolute_unfairness(results, gender_map, k, disadv="F", adv="M"):
-    """
-    Absolute Unfairness (AU).
-
-    Uabs = (1/n) Σ_j ||y_d_j - r_d_j| - |y_a_j - r_a_j||
-
-    Matches ILAP reference: mean of absolute differences of absolute errors.
-    Zero = fair; higher = more unfair.
-    """
     items, y_d, y_a, r_d, r_a = _build_item_score_tables(
         results, gender_map, k, disadv, adv)
     if not items:
@@ -268,14 +183,6 @@ def absolute_unfairness(results, gender_map, k, disadv="F", adv="M"):
 
 
 def underestimation_unfairness(results, gender_map, k, disadv="F", adv="M"):
-    """
-    Underestimation Unfairness (UU).
-
-    Uunder = (1/n) Σ_j |max(0, r_d_j - y_d_j) - max(0, r_a_j - y_a_j)|
-
-    Matches ILAP reference: mean of absolute per-item underestimation gaps.
-    Zero = fair; higher = more unfair.
-    """
     items, y_d, y_a, r_d, r_a = _build_item_score_tables(
         results, gender_map, k, disadv, adv)
     if not items:
@@ -286,14 +193,6 @@ def underestimation_unfairness(results, gender_map, k, disadv="F", adv="M"):
 
 
 def overestimation_unfairness(results, gender_map, k, disadv="F", adv="M"):
-    """
-    Overestimation Unfairness (OU).
-
-    Uover = (1/n) Σ_j |max(0, y_d_j - r_d_j) - max(0, y_a_j - r_a_j)|
-
-    Matches ILAP reference: mean of absolute per-item overestimation gaps.
-    Zero = fair; higher = more unfair.
-    """
     items, y_d, y_a, r_d, r_a = _build_item_score_tables(
         results, gender_map, k, disadv, adv)
     if not items:
@@ -304,13 +203,6 @@ def overestimation_unfairness(results, gender_map, k, disadv="F", adv="M"):
 
 
 def nonparity_unfairness(results, gender_map, k, disadv="F", adv="M"):
-    """
-    NonParity Unfairness (NU).
-
-    Upar = |avg_y_disadv - avg_y_adv|
-
-    Difference in average predicted scores between groups.
-    """
     items, y_d, y_a, _, _ = _build_item_score_tables(
         results, gender_map, k, disadv, adv)
     if not items:
@@ -319,16 +211,6 @@ def nonparity_unfairness(results, gender_map, k, disadv="F", adv="M"):
 
 
 def ks_statistic(results, gender_map, k, disadv="F", adv="M"):
-    """
-    Kolmogorov-Smirnov Statistic.
-
-    Computes the KS statistic between the per-user utility (NDCG@K)
-    distributions of the two gender groups.
-
-    KS = max |CDF_M(x) - CDF_F(x)|
-
-    Returns: (ks_stat, p_value)
-    """
     utilities = {"M": [], "F": []}
     for res in results:
         g = gender_map.get(res["user"])
@@ -345,15 +227,6 @@ def ks_statistic(results, gender_map, k, disadv="F", adv="M"):
 
 def generalized_cross_entropy(results, gender_map, k,
                                disadv="F", adv="M", alpha=0.5):
-    """
-    Generalized Cross Entropy (GCE) — Hellinger distance (α=0.5).
-
-    Measures divergence between observed per-group HR@K distribution and
-    the fair (equal HR) distribution. Uses per-user hit rates so the metric
-    is independent of group size, making it comparable across models.
-
-    Returns: gce (float), lower is fairer (0 = perfectly fair HR across groups).
-    """
     hits = {"M": [], "F": []}
     for res in results:
         g = gender_map.get(res["user"])
@@ -369,9 +242,7 @@ def generalized_cross_entropy(results, gender_map, k,
     if total_hr == 0:
         return 0.0
 
-    # Observed distribution over groups (by HR contribution)
     p   = {g: hr[g] / total_hr for g in ("M", "F")}
-    # Fair distribution: equal HR share
     p_f = {"M": 0.5, "F": 0.5}
 
     inner = sum(
@@ -384,12 +255,6 @@ def generalized_cross_entropy(results, gender_map, k,
 
 def compute_all_ilap_metrics(results, gender_map, k=10,
                               disadv="F", adv="M"):
-    """
-    Compute all 7 ILAP fairness metrics at once.
-
-    Returns:
-        dict with keys: DF, VU, AU, UU, OU, NU, KS, KS_pval, GCE
-    """
     ks_stat, ks_p = ks_statistic(results, gender_map, k, disadv, adv)
     return {
         "DF":      differential_fairness(results,       gender_map, k, disadv, adv),
@@ -422,21 +287,12 @@ def print_ilap_report(ilap_dict, k=10, label="Model"):
         if key in ilap_dict:
             print(f"  {name:<35} {ilap_dict[key]:>8.4f}  ({hint})")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 4. Additional Fairness Metrics
-# ══════════════════════════════════════════════════════════════════════════════
-
 def equalized_opportunity(group_metrics, k):
     """|HR_M@K − HR_F@K|.  Target ≈ 0."""
     return abs(group_metrics["M"][k]["HR"] - group_metrics["F"][k]["HR"])
 
 
 def demographic_parity(results, gender_map, k):
-    """
-    Jaccard similarity of aggregate top-K recommendation sets for M vs F.
-    High = both groups are recommended from the same catalog space.
-    """
     rec_sets = {"M": set(), "F": set()}
     for res in results:
         g = gender_map.get(res["user"])
@@ -448,25 +304,6 @@ def demographic_parity(results, gender_map, k):
 
 
 def counterfactual_fairness_score(results, gender_map, adj, k):
-    """
-    Counterfactual fairness via demographic-flip simulation.
-
-    For each user u, we construct a counterfactual user u' that is identical
-    to u in every way except their gender node is swapped (M↔F).  We then
-    measure how much u's recommendations would change if the system "saw"
-    the opposite gender — using the overlap between:
-      - u's actual top-K recommendations
-      - top-K recommendations of the most taste-similar opposite-gender user
-
-    A high score means the model's recommendations are stable across gender
-    (i.e., gender doesn't drive the output) → fairer.
-
-    Score = 1 - mean_gender_sensitivity, where gender_sensitivity per user
-    is the fraction of their top-K recs that differ from their closest
-    opposite-gender twin.  Score closer to 1.0 = more counterfactually fair.
-
-    Returns: (score, n_pairs)
-    """
     result_lookup = {res["user"]: res["top_k_recs"] for res in results}
     user_liked    = {res["user"]: frozenset(adj.get(res["user"], {}).get("likes", set()))
                      for res in results}
@@ -487,7 +324,6 @@ def counterfactual_fairness_score(results, gender_map, adj, k):
         pool    = female_users if gender == "M" else male_users
         liked_u = user_liked[u]
 
-        # Find taste-closest opposite-gender user as counterfactual proxy
         best_sim, best_v = -1.0, None
         for v in pool:
             sim = jaccard(liked_u, user_liked[v])
@@ -498,11 +334,9 @@ def counterfactual_fairness_score(results, gender_map, adj, k):
 
         recs_u = set(result_lookup[u][:k])
         recs_v = set(result_lookup[best_v][:k])
-        # Sensitivity = fraction of recs that differ when gender is flipped
         sensitivity = 1.0 - (len(recs_u & recs_v) / k) if k > 0 else 0.0
         sensitivities.append(sensitivity)
 
-    # Score = 1 - mean_sensitivity  (higher = more stable = fairer)
     mean_sensitivity = float(np.mean(sensitivities)) if sensitivities else 0.0
     score = 1.0 - mean_sensitivity
     return score, len(sensitivities)
@@ -510,11 +344,6 @@ def counterfactual_fairness_score(results, gender_map, adj, k):
 
 def print_additional_fairness_report(results, group_metrics, gender_map,
                                      adj, k_values=(5, 10), label="Model"):
-    """Print a compact group-level fairness summary.
-
-    ILAP metrics are the main fairness block in this project. This report is
-    intentionally short and avoids extra threshold-based metrics.
-    """
     print(f"\n{'─'*50}")
     print(f"Group-level Fairness Summary — {label}")
     print(f"{'─'*50}")
@@ -530,12 +359,7 @@ def print_additional_fairness_report(results, group_metrics, gender_map,
               f"{dp:>8.4f} | {cf:>8.4f}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 5. Path Fairness Metrics  (novel KG-specific contribution)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _safe_entropy_from_counts(counter):
-    """Entropy of a Counter as a simple explanation-diversity score."""
     total = sum(counter.values())
     if total <= 0:
         return 0.0
@@ -544,13 +368,6 @@ def _safe_entropy_from_counts(counter):
 
 
 def path_type_counter(results, k=None):
-    """
-    Count explanation path types from the stored ``pattern_types`` field.
-
-    This is preferable to reading the first relation in the raw path, because
-    most recommendation paths start with ``User -> likes``. The meaningful
-    explanation type is the extracted pattern type: genre/director/cf/cast/writer.
-    """
     counter = Counter()
     for res in results:
         pts = res.get("pattern_types", [])
@@ -561,12 +378,6 @@ def path_type_counter(results, k=None):
 
 
 def path_diversity_summary(results, k=10):
-    """
-    Summarize explanation diversity for the top-K recommendations.
-
-    Returns dominant path type, dominant path ratio, entropy and raw counts.
-    Higher entropy and lower dominant ratio mean less explanation concentration.
-    """
     counter = path_type_counter(results, k=k)
     total = sum(counter.values())
     if total == 0:
@@ -588,14 +399,6 @@ def path_diversity_summary(results, k=10):
 
 
 def path_type_distribution(results, gender_map, disadv="F", adv="M", k=None):
-    """
-    For each gender group, compute the fraction of recommendation explanation
-    path types (genre/director/cf/cast/writer) in the top-K list.
-
-    Important: this uses ``result['pattern_types']`` instead of raw path[1],
-    because raw paths usually begin with ``likes`` and would hide the actual
-    explanation type.
-    """
     rel_counts = {"M": Counter(), "F": Counter()}
 
     for res in results:
@@ -617,7 +420,6 @@ def path_type_distribution(results, gender_map, disadv="F", adv="M", k=None):
 
 
 def print_path_diversity_report(results, k=10, label="Model"):
-    """Print overall explanation path diversity for a result list."""
     summary = path_diversity_summary(results, k=k)
     print(f"\n{'─'*50}")
     print(f"Path-Type Diversity — {label} @ K={k}")
@@ -634,23 +436,6 @@ def print_path_diversity_report(results, k=10, label="Model"):
 
 def cross_genre_access(results, gender_map, adj, genre_key="hasGenre",
                         k=10, disadv="F", adv="M"):
-    """
-    Among users who both like at least one Action/Drama/etc. movie in training,
-    compare the fraction whose top-K recommendations include movies of that genre.
-
-    This tests proxy bias: do female Action fans get Action recommendations
-    as often as male Action fans?
-
-    Args:
-        results:    list of dicts with 'user', 'top_k_recs'
-        gender_map: dict user_node → 'M'|'F'
-        adj:        KG adjacency (to get user's liked genres)
-
-    Returns:
-        DataFrame-like list of dicts per genre:
-            {genre, access_M, access_F, gap, gap_direction}
-    """
-    # Build: genre → {user_node → has_genre_in_liked_movies}
     genre_to_users = defaultdict(lambda: {"M": [], "F": []})
 
     for res in results:
@@ -671,7 +456,6 @@ def cross_genre_access(results, gender_map, adj, genre_key="hasGenre",
             {"user": u, "liked_genres": liked_genres, "rec_genres": top_k_genres}
         )
 
-    # Collect all genres seen in liked movies
     all_genres = set()
     for g in ("M", "F"):
         for entry in genre_to_users["__all__"][g]:
@@ -708,15 +492,6 @@ def cross_genre_access(results, gender_map, adj, genre_key="hasGenre",
 
 
 def path_length_fairness(results, gender_map, disadv="F", adv="M"):
-    """
-    Compare average recommendation path length between gender groups.
-
-    Longer paths = weaker evidence = less confident recommendations.
-    A gap here means the KG has sparser coverage of one group's preferences.
-
-    Returns:
-        dict {gender: {'mean_len', 'std_len', 'n'}}
-    """
     lengths = {"M": [], "F": []}
 
     for res in results:
@@ -739,14 +514,6 @@ def path_length_fairness(results, gender_map, disadv="F", adv="M"):
 
 
 def path_score_ks(results, gender_map, disadv="F", adv="M"):
-    """
-    KS test on per-user average path score distributions by gender.
-
-    A significant KS stat means the model assigns systematically
-    different confidence scores to one gender's recommendations.
-
-    Returns: (ks_stat, p_value)
-    """
     scores = {"M": [], "F": []}
 
     for res in results:
@@ -769,14 +536,12 @@ def print_path_fairness_report(results, gender_map, adj, k=10, label="Model"):
     print(f"Path Fairness Metrics — {label} @ K={k}")
     print(f"{'─'*50}")
 
-    # Path length
     pl = path_length_fairness(results, gender_map)
     print(f"\n  Path Length by Gender:")
     print(f"    Male   : mean={pl['M']['mean_len']:.2f}  std={pl['M']['std_len']:.2f}  n={pl['M']['n']}")
     print(f"    Female : mean={pl['F']['mean_len']:.2f}  std={pl['F']['std_len']:.2f}  n={pl['F']['n']}")
     print(f"    Gap    : {pl['gap']:.2f}")
 
-    # Path type distribution
     dist = path_type_distribution(results, gender_map, k=k)
     all_rels = sorted(set(dist["M"]) | set(dist["F"]))
     if all_rels:
@@ -788,7 +553,6 @@ def print_path_fairness_report(results, gender_map, adj, k=10, label="Model"):
             pf = dist["F"].get(rel, 0.0)
             print(f"    {rel:<25} {pm:>8.3f} {pf:>8.3f} {pm - pf:>+8.3f}")
 
-    # Cross-genre access
     cga = cross_genre_access(results, gender_map, adj, k=k)
     if cga:
         print(f"\n  Cross-Genre Access (top-5 most biased genres):")

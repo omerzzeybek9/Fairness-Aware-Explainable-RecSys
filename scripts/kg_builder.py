@@ -1,32 +1,3 @@
-"""
-kg_builder.py — Knowledge Graph construction for movie recommendation.
-
-Pipelines included:
-
-1. Wikidata pipeline, safer version:
-   - searches Wikidata QIDs with retry/backoff
-   - caches QID progress while running
-   - fetches KG triples with smaller SPARQL batches
-   - resolves labels in safer smaller batches
-   - saves and reuses KG cache
-
-2. IMDb offline pipeline:
-   - uses local IMDb TSV files
-   - no network calls
-   - no Wikidata rate limits
-
-Main entry points:
-    load_or_build_kg(movies_sub, cache_path="cache/kg_cache_wikidata.pkl")
-        -> Wikidata KG
-
-    load_or_build_kg_imdb(movies_sub, imdb_dir="data/imdb",
-                          cache_path="cache/kg_cache_imdb.pkl")
-        -> IMDb KG, recommended when full ML-100K causes Wikidata rate limits
-
-    build_adj(readable_triples, user_item_edges, user_info)
-        -> adjacency graph
-"""
-
 import os
 import pickle
 import random
@@ -35,11 +6,6 @@ import time
 from collections import Counter, defaultdict
 
 import requests
-
-
-# ---------------------------------------------------------------------------
-# Relation definitions
-# ---------------------------------------------------------------------------
 
 BASE_RELS = {
     "likes",
@@ -69,24 +35,9 @@ _KG_RELATIONS = {
 
 DEFAULT_USER_AGENT = "KGProject/1.0 academic-research contact: student-project"
 
-
-# ---------------------------------------------------------------------------
-# Safe request helper for Wikidata
-# ---------------------------------------------------------------------------
-
-
 def safe_get(url, params=None, headers=None, timeout=20,
              max_retries=6, base_sleep=2.0):
-    """
-    Safe requests.get wrapper for Wikidata.
 
-    Handles:
-      - 429 Too Many Requests
-      - temporary 5xx server errors
-      - connection/time-out errors
-
-    Uses exponential backoff and respects Retry-After when available.
-    """
     headers = headers or {"User-Agent": DEFAULT_USER_AGENT}
 
     for attempt in range(max_retries):
@@ -131,20 +82,7 @@ def safe_get(url, params=None, headers=None, timeout=20,
     print("  Request failed after maximum retries.")
     return None
 
-
-# ---------------------------------------------------------------------------
-# Wikidata QID Search
-# ---------------------------------------------------------------------------
-
-
 def wikidata_search(title, sleep_s=1.0):
-    """
-    Search Wikidata for a movie QID by title.
-    Prefers results whose description contains 'film'.
-
-    Returns:
-        QID string, for example 'Q12345', or None.
-    """
     url = "https://www.wikidata.org/w/api.php"
     params = {
         "action": "wbsearchentities",
@@ -188,20 +126,6 @@ def wikidata_search(title, sleep_s=1.0):
 
 
 def fetch_qid_map(movies_sub, sleep_s=1.0, cache_path="cache/qid_map.pkl"):
-    """
-    Fetch Wikidata QIDs with progress caching.
-
-    If interrupted or rate-limited, already fetched QIDs are saved and reused.
-
-    Args:
-        movies_sub : DataFrame with ['movieId', 'title']
-        sleep_s    : delay between QID search requests
-        cache_path : separate progress cache for QID lookup
-
-    Returns:
-        qid_map    : dict {movieId -> QID or None}
-        movies_out : movies_sub copy with 'qid' column, rows without QID dropped
-    """
     cache_dir = os.path.dirname(cache_path)
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
@@ -246,12 +170,6 @@ def fetch_qid_map(movies_sub, sleep_s=1.0, cache_path="cache/qid_map.pkl"):
 
     return qid_map, df
 
-
-# ---------------------------------------------------------------------------
-# Wikidata SPARQL Property Fetch
-# ---------------------------------------------------------------------------
-
-
 def _init_sparql():
     """Initialize SPARQLWrapper for Wikidata."""
     from SPARQLWrapper import JSON, SPARQLWrapper
@@ -266,12 +184,6 @@ def _init_sparql():
 
 
 def get_film_properties(qid, sparql):
-    """
-    Fetch genre, director, country, cast, composer, and screenwriter for one movie QID.
-
-    Returns:
-        list of (film_qid, relation, tail_qid) triples
-    """
     query = f"""
     SELECT ?genre ?director ?country ?cast ?composer ?screenwriter WHERE {{
         OPTIONAL {{ wd:{qid} wdt:P136 ?genre . }}
@@ -304,20 +216,6 @@ def get_film_properties(qid, sparql):
 
 
 def fetch_kg_triples(qid_map, sleep_s=4.0, batch_size=5):
-    """
-    Fetch KG triples for all movies that have QIDs.
-
-    Uses smaller SPARQL batches to reduce rate-limit/server-pressure problems.
-    If a batch fails, it retries movies individually.
-
-    Args:
-        qid_map    : dict {movieId -> QID or None}
-        sleep_s    : delay between SPARQL calls
-        batch_size : number of QIDs per SPARQL query
-
-    Returns:
-        kg_triples : list of (qid, relation, tail_qid)
-    """
     sparql = _init_sparql()
     kg_triples = []
 
@@ -387,17 +285,7 @@ def fetch_kg_triples(qid_map, sleep_s=4.0, batch_size=5):
 
     return kg_triples
 
-
-# ---------------------------------------------------------------------------
-# Wikidata Label Resolution
-# ---------------------------------------------------------------------------
-
-
 def get_label(qid, label_cache):
-    """
-    Resolve a single Wikidata QID to its English label.
-    Updates label_cache in-place.
-    """
     if qid in label_cache:
         return label_cache[qid]
 
@@ -424,9 +312,6 @@ def get_label(qid, label_cache):
 
 
 def get_labels_batch(qids, label_cache, batch_size=25, sleep_s=1.0):
-    """
-    Resolve multiple Wikidata QIDs to English labels in safe smaller batches.
-    """
     missing = [
         q for q in qids
         if q not in label_cache and isinstance(q, str) and q.startswith("Q")
@@ -472,19 +357,6 @@ def get_labels_batch(qids, label_cache, batch_size=25, sleep_s=1.0):
 
 
 def build_readable_triples(kg_triples, movies_sub, label_cache=None):
-    """
-    Convert QID-based triples to human-readable triples.
-    Also adds year triples extracted from movie titles.
-
-    Args:
-        kg_triples  : list of (qid, relation, tail_qid)
-        movies_sub  : DataFrame with 'qid' and 'title' columns
-        label_cache : dict to reuse/update
-
-    Returns:
-        readable_triples : list of (movie_title, relation, label)
-        label_cache      : updated dict
-    """
     if label_cache is None:
         label_cache = {}
 
@@ -530,25 +402,7 @@ def build_readable_triples(kg_triples, movies_sub, label_cache=None):
 
     return readable_triples, label_cache
 
-
-# ---------------------------------------------------------------------------
-# Adjacency Graph
-# ---------------------------------------------------------------------------
-
-
 def build_adj(readable_triples, user_item_edges, user_info):
-    """
-    Build KG adjacency graph from readable triples, user-item edges,
-    and user demographic info.
-
-    Args:
-        readable_triples : list of (head, relation, tail)
-        user_item_edges  : list of ('User_<id>', 'likes', movie_title)
-        user_info        : dict {userId -> {'gender': 'M'|'F', ...}}
-
-    Returns:
-        adj : defaultdict[node -> defaultdict[relation -> set(tails)]]
-    """
     def rev_rel(r):
         return f"rev_{r}"
 
@@ -559,7 +413,6 @@ def build_adj(readable_triples, user_item_edges, user_info):
         adj[h][r].add(t)
         adj[t][rev_rel(r)].add(h)
 
-    # KG triples.
     qcode = re.compile(r"^Q\d+$")
 
     for h, r, t in readable_triples:
@@ -572,7 +425,6 @@ def build_adj(readable_triples, user_item_edges, user_info):
         adj[h][r].add(t)
         adj[t][rev_rel(r)].add(h)
 
-    # Gender edges for fairness auditing and the optional gender baseline.
     for uid, info in user_info.items():
         g = info.get("gender")
 
@@ -591,12 +443,6 @@ def build_adj(readable_triples, user_item_edges, user_info):
         print(f"  {r}: {c}")
 
     return adj
-
-
-# ---------------------------------------------------------------------------
-# Cache helpers
-# ---------------------------------------------------------------------------
-
 
 def save_kg_cache(cache_path, qid_map, label_cache, kg_triples, readable_triples):
     """Save KG data to pickle cache."""
@@ -619,7 +465,6 @@ def save_kg_cache(cache_path, qid_map, label_cache, kg_triples, readable_triples
 
 
 def load_kg_cache(cache_path):
-    """Load KG data from pickle cache."""
     with open(cache_path, "rb") as f:
         kg_data = pickle.load(f)
 
@@ -631,38 +476,11 @@ def load_kg_cache(cache_path):
     )
 
 
-# ---------------------------------------------------------------------------
-# Main Wikidata Entry Point
-# ---------------------------------------------------------------------------
-
-
 def load_or_build_kg(movies_sub, cache_path="cache/kg_cache_wikidata.pkl",
                      qid_cache_path="cache/ml100k_qid_map.pkl",
                      qid_sleep_s=1.5,
                      sparql_sleep_s=4.0,
                      sparql_batch_size=5):
-    """
-    Load Wikidata KG from cache if available, otherwise build and save.
-
-    Incremental behavior:
-        If cache exists but some requested movies are missing, only the new
-        movies are fetched and merged into the existing cache.
-
-    Args:
-        movies_sub          : DataFrame with ['movieId', 'title']
-        cache_path          : full KG cache file
-        qid_cache_path      : progress cache for QID lookup
-        qid_sleep_s         : delay between QID search requests
-        sparql_sleep_s      : delay between SPARQL requests
-        sparql_batch_size   : QIDs per SPARQL query
-
-    Returns:
-        qid_map          : dict {movieId -> QID}
-        label_cache      : dict {QID -> label}
-        kg_triples       : list of QID triples
-        readable_triples : list of readable triples
-        movies_out       : movies_sub with qid column, rows without QID dropped
-    """
     needed_ids = set(movies_sub["movieId"].astype(int))
 
     if os.path.exists(cache_path):
@@ -736,7 +554,6 @@ def load_or_build_kg(movies_sub, cache_path="cache/kg_cache_wikidata.pkl",
 
         return qid_map, label_cache, kg_triples, readable_triples, movies_out
 
-    # No full KG cache exists.
     n = len(movies_sub)
     n_batches = (n + sparql_batch_size - 1) // sparql_batch_size
 
@@ -776,28 +593,7 @@ def load_or_build_kg(movies_sub, cache_path="cache/kg_cache_wikidata.pkl",
 
     return qid_map, label_cache, kg_triples, readable_triples, movies_out
 
-
-# ---------------------------------------------------------------------------
-# IMDb Pipeline, offline and no rate limits
-# ---------------------------------------------------------------------------
-
-
 def load_imdb_data(imdb_dir="data/imdb"):
-    """
-    Load the four IMDb TSV files into memory.
-
-    Required files in imdb_dir:
-        title.basics.tsv
-        title.crew.tsv
-        title.principals.tsv
-        name.basics.tsv
-
-    Returns:
-        basics_df
-        crew_df
-        principals_df
-        names_dict
-    """
     import pandas as pd
 
     print("Loading IMDb datasets...")
@@ -858,17 +654,6 @@ def load_imdb_data(imdb_dir="data/imdb"):
 
 
 def match_movies_to_imdb(movies_sub, basics_df):
-    """
-    Match MovieLens movie titles, for example 'Toy Story (1995)', to IMDb tconst IDs.
-
-    Matching strategy:
-        1. primaryTitle + year
-        2. originalTitle + year
-        3. primaryTitle only
-
-    Returns:
-        tconst_map : dict {movieId -> tconst or None}
-    """
     basics_idx = basics_df.copy()
     basics_idx["norm_primary"] = basics_idx["primaryTitle"].str.lower().str.strip()
     basics_idx["norm_original"] = basics_idx["originalTitle"].fillna("").str.lower().str.strip()
@@ -923,23 +708,6 @@ def match_movies_to_imdb(movies_sub, basics_df):
 
 def build_kg_from_imdb(movies_sub, tconst_map, basics_df, crew_df,
                        principals_df, names_dict, max_cast=5):
-    """
-    Build human-readable KG triples directly from IMDb local data.
-
-    Relations produced:
-        hasGenre
-        directedBy
-        writtenBy
-        hasCast
-        hasComposer
-        year
-
-    Args:
-        max_cast : maximum top-billed actors per movie
-
-    Returns:
-        readable_triples : list of (movie_title, relation, entity_name)
-    """
     import pandas as pd
 
     mid_to_title = dict(zip(movies_sub["movieId"].astype(int), movies_sub["title"]))
@@ -982,7 +750,6 @@ def build_kg_from_imdb(movies_sub, tconst_map, basics_df, crew_df,
                 if name:
                     readable_triples.append((title, "writtenBy", name))
 
-    # Cast and composer triples.
     cat_to_rel = {
         "actor":          "hasCast",
         "actress":        "hasCast",
@@ -1026,20 +793,6 @@ def build_kg_from_imdb(movies_sub, tconst_map, basics_df, crew_df,
 
 def load_or_build_kg_imdb(movies_sub, imdb_dir="data/imdb",
                           cache_path="cache/kg_cache_imdb.pkl", max_cast=5):
-    """
-    Build the KG from local IMDb TSV files.
-
-    No network calls, no Wikidata rate limits.
-
-    Return signature matches load_or_build_kg. The qid_map field stores
-    movieId -> tconst.
-
-    Args:
-        movies_sub : DataFrame with ['movieId', 'title']
-        imdb_dir   : directory containing IMDb TSV files
-        cache_path : path to cache file
-        max_cast   : maximum top-billed actors per movie
-    """
     needed_ids = set(movies_sub["movieId"].astype(int))
 
     if os.path.exists(cache_path):
@@ -1095,7 +848,6 @@ def load_or_build_kg_imdb(movies_sub, imdb_dir="data/imdb",
 
         return tconst_map, {}, [], readable_triples, movies_out
 
-    # No IMDb KG cache exists.
     print(f"No cache at '{cache_path}' — full IMDb build for {len(movies_sub)} movies.")
 
     basics_df, crew_df, principals_df, names_dict = load_imdb_data(imdb_dir)

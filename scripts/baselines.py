@@ -1,26 +1,3 @@
-"""
-baselines.py — GPT-2 + Gender baseline for comparison against the main model.
-
-run_gpt2_gender(test_set_dict, adj, all_users, movie_titles_set,
-                base_rels, device, ...)
-    → GPT-2 path model WITH gender-aware paths included.
-      Proves the demographic-blind approach works: removing demographic info
-      improves both accuracy and fairness.
-
-Returns a results list in the same format as the main model:
-    [{"user": "User_<id>", "ground_truths": [...], "top_k_recs": [...],
-      "pattern_types": [...], "num_gt": int}, ...]
-
-Usage (in notebook):
-    import importlib
-    import scripts.baselines as baselines
-    importlib.reload(baselines)
-
-    results_gender, *_ = baselines.run_gpt2_gender(
-        test_set_dict, adj, all_users, movie_titles_set,
-        BASE_RELS, device, k_values=K_VALUES)
-"""
-
 import random
 
 from tqdm import tqdm
@@ -30,18 +7,7 @@ from model import (build_vocab, create_path_dataset, create_model,
                    train_model, generate_topk)
 from metrics import evaluate_ranking
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Gender-aware path sampler
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _sample_gender_cf_path(user_node, adj):
-    """
-    User → hasGender → Gender_X → rev_hasGender → UserB → likes → Movie
-
-    Bridges users of the same gender, explicitly using demographic info.
-    This is exactly what the main model avoids.
-    """
     if user_node not in adj:
         return None
     genders = list(adj[user_node].get("hasGender", set()))
@@ -61,11 +27,6 @@ def _sample_gender_cf_path(user_node, adj):
     movie = random.choice(candidates)
     return [user_node, "hasGender", gender_node, "rev_hasGender", user_b, "likes", movie]
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# GPT-2 + Gender Baseline
-# ══════════════════════════════════════════════════════════════════════════════
-
 def run_gpt2_gender(test_set_dict, adj, all_users, movie_titles_set,
                     base_rels, device,
                     k_values=(1, 3, 5, 10),
@@ -78,29 +39,7 @@ def run_gpt2_gender(test_set_dict, adj, all_users, movie_titles_set,
                     max_paths_per_movie=4,
                     eval_batch_size=512,
 ):
-    """
-    Train and evaluate a GPT-2 path model that INCLUDES gender-aware paths.
 
-    Parameters
-    ----------
-    test_set_dict    : dict   {"User_<id>" -> [ground_truth, ...]}
-    adj              : dict   KG adjacency graph (must contain hasGender edges)
-    all_users        : list   training user node strings
-    movie_titles_set : set    all valid movie title strings
-    base_rels        : set    base relation tokens
-    device           : torch.device
-    k_values         : tuple  cutoff values
-    paths_per_user   : int    path attempts per user
-    gender_weight    : float  sampling weight for gender pattern (0–1)
-    epochs           : int    training epochs
-    lr               : float  learning rate
-    patience         : int    early stopping patience
-    seed             : int    random seed
-
-    Returns
-    -------
-    results, model, vocab, id2tok, PAD, BOS, EOS, UNK, MAX_LEN
-    """
     random.seed(seed)
 
     print("=" * 60)
@@ -129,7 +68,6 @@ def run_gpt2_gender(test_set_dict, adj, all_users, movie_titles_set,
     finally:
         _paths_mod._SAMPLERS.pop("gender", None)
 
-    # Step 2: Build vocab & dataset
     print("\n[2/4] Building vocabulary and dataset...")
     vocab, id2tok, PAD, BOS, EOS, UNK = build_vocab(paths, gender_base_rels)
     print(f"Vocab size: {len(vocab)}")
@@ -138,7 +76,6 @@ def run_gpt2_gender(test_set_dict, adj, all_users, movie_titles_set,
         batch_size=64, val_ratio=0.1,
     )
 
-    # Step 3: Train
     print("\n[3/4] Training GPT-2 + Gender model...")
     model = create_model(
         vocab_size=len(vocab), max_len=MAX_LEN,
@@ -150,7 +87,6 @@ def run_gpt2_gender(test_set_dict, adj, all_users, movie_titles_set,
         epochs=epochs, lr=lr, patience=patience,
     )
 
-    # Step 4: Evaluate
     print("\n[4/4] Evaluating...")
     max_k = max(k_values)
     results = []
