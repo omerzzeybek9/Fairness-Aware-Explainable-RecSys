@@ -127,24 +127,66 @@ def sample_writer_path(user_node, adj):
     return [user_node, "likes", movie_a, "writtenBy", writer, "rev_writtenBy", movie_b]
 
 
+
+def sample_producer_path(user_node, adj):
+    """User → likes → MovieA → hasProducer → Producer → rev_hasProducer → MovieB"""
+    liked = list(adj[user_node].get("likes", set()))
+    if not liked:
+        return None
+    movie_a = random.choice(liked)
+    producers = list(adj[movie_a].get("hasProducer", set()))
+    if not producers:
+        return None
+    producer = random.choice(producers)
+    candidates = list(adj[producer].get("rev_hasProducer", set()) - {movie_a})
+    if not candidates:
+        return None
+    movie_b = random.choice(candidates)
+    return [user_node, "likes", movie_a, "hasProducer", producer, "rev_hasProducer", movie_b]
+
+
+def sample_cinematographer_path(user_node, adj):
+    """User → likes → MovieA → hasCinematographer → DP → rev_hasCinematographer → MovieB"""
+    liked = list(adj[user_node].get("likes", set()))
+    if not liked:
+        return None
+    movie_a = random.choice(liked)
+    dps = list(adj[movie_a].get("hasCinematographer", set()))
+    if not dps:
+        return None
+    dp = random.choice(dps)
+    candidates = list(adj[dp].get("rev_hasCinematographer", set()) - {movie_a})
+    if not candidates:
+        return None
+    movie_b = random.choice(candidates)
+    return [user_node, "likes", movie_a, "hasCinematographer", dp, "rev_hasCinematographer", movie_b]
+
+
 # ── Main sampling function ─────────────────────────────────────────────────────
 
+# Composer is excluded from the default pattern set: ML-100K's KG is too
+# sparse in composer information for it to be a reliable explanation type.
+# The remaining five patterns are sampled uniformly to avoid biasing the
+# model towards any single explanation type.
 DEFAULT_PATTERN_WEIGHTS = {
-    "genre":    0.25,
-    "director": 0.20,
-    "cf":       0.20,
-    "cast":     0.15,
-    "composer": 0.10,
-    "writer":   0.10,
+    "genre":           0.20,
+    "director":        0.20,
+    "cf":              0.20,
+    "cast":            0.15,
+    "writer":          0.10,
+    "producer":        0.10,
+    "cinematographer": 0.05,
 }
 
 _SAMPLERS = {
-    "genre":    sample_genre_path,
-    "director": sample_director_path,
-    "cf":       sample_cf_path,
-    "cast":     sample_cast_path,
-    "composer": sample_composer_path,
-    "writer":   sample_writer_path,
+    "genre":           sample_genre_path,
+    "director":        sample_director_path,
+    "cf":              sample_cf_path,
+    "cast":            sample_cast_path,
+    "composer":        sample_composer_path,
+    "writer":          sample_writer_path,
+    "producer":        sample_producer_path,
+    "cinematographer": sample_cinematographer_path,
 }
 
 

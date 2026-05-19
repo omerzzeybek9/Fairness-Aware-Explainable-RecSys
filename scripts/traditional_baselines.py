@@ -50,9 +50,7 @@ from tqdm import tqdm
 
 from metrics import (
     evaluate_ranking, compute_group_metrics,
-    compute_all_ilap_metrics, print_ilap_report,
-    disparate_impact, equalized_opportunity,
-    demographic_parity, counterfactual_fairness_score,
+    compute_all_ilap_metrics, print_ilap_report
 )
 
 
@@ -516,11 +514,6 @@ def compare_all(models_dict, user_gender_map, adj=None, k_values=(1, 3, 5, 10)):
     for label, res in models_dict.items():
         rm   = evaluate_ranking(res, k_values=k_values)
         gm   = compute_group_metrics(res, user_gender_map, k_values)
-        di   = disparate_impact(gm, k10)
-        eo   = equalized_opportunity(gm, k10)
-        dp   = demographic_parity(res, user_gender_map, k10)
-        cf   = counterfactual_fairness_score(res, user_gender_map, adj or {}, k10)[0] \
-               if adj is not None else float("nan")
 
         hr_m = gm["M"][k10]["HR"]
         hr_f = gm["F"][k10]["HR"]
@@ -528,12 +521,10 @@ def compare_all(models_dict, user_gender_map, adj=None, k_values=(1, 3, 5, 10)):
 
         print(f"{label:<18} {rm[k10]['HR']:>7.4f} {rm[k10]['MRR']:>7.4f} "
               f"{rm[k10]['NDCG']:>8.4f} "
-              f"{hr_m:>7.4f} {hr_f:>7.4f} {gap:>+7.4f} "
-              f"{di:>7.4f} {eo:>7.4f} {dp:>7.4f} {cf:>7.4f}")
+              f"{hr_m:>7.4f} {hr_f:>7.4f} {gap:>+7.4f} ")
 
         all_rows[label] = {
             "ranking": rm, "group": gm,
-            "DI": di, "EO": eo, "DP": dp, "CF": cf,
         }
 
     print(sep)

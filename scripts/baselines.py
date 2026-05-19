@@ -72,7 +72,12 @@ def run_gpt2_gender(test_set_dict, adj, all_users, movie_titles_set,
                     paths_per_user=200,
                     gender_weight=0.20,
                     epochs=10, lr=3e-4, patience=2,
-                    seed=42):
+                    seed=42,
+                    lambda_div=0.03,
+                    path_balance_free_repeats=2,
+                    max_paths_per_movie=4,
+                    eval_batch_size=512,
+):
     """
     Train and evaluate a GPT-2 path model that INCLUDES gender-aware paths.
 
@@ -105,8 +110,8 @@ def run_gpt2_gender(test_set_dict, adj, all_users, movie_titles_set,
     # Step 1: Sample paths with gender pattern mixed in
     print("\n[1/4] Sampling paths (with gender-aware pattern)...")
     base_patterns = {
-        "genre": 0.25, "director": 0.20, "cf": 0.20,
-        "cast": 0.15, "composer": 0.10, "writer": 0.10,
+        "genre": 0.25, "director": 0.20, "cf": 0.25,
+        "cast": 0.15, "writer": 0.15,
     }
     scale = 1.0 - gender_weight
     pattern_weights = {k: v * scale for k, v in base_patterns.items()}
@@ -158,7 +163,12 @@ def run_gpt2_gender(test_set_dict, adj, all_users, movie_titles_set,
             user_node, model, vocab, id2tok, adj, gender_base_rels,
             movie_titles_set, PAD, BOS, EOS, UNK, MAX_LEN,
             device=device, K=max_k,
-            max_total_attempts=None,   # adaptive — matches main model behaviour
+            max_total_attempts=None,   # deterministic candidate enumeration
+            include_gender=True,       # GPT-2+Gender control baseline
+            max_paths_per_movie=max_paths_per_movie,
+            lambda_div=lambda_div,
+            path_balance_free_repeats=path_balance_free_repeats,
+            eval_batch_size=eval_batch_size,
         )
         if not topk_with_type:
             continue

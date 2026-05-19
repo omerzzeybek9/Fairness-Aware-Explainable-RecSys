@@ -5,8 +5,8 @@ Sections:
     1. Standard ranking metrics      — HR@K, MRR@K, NDCG@K
     2. Group evaluation              — per-gender metric breakdown
     3. ILAP fairness metrics         — DF, VU, AU, UU, OU, NU, KS, GCE
-    4. Additional fairness metrics   — Disparate Impact, Equalized Opportunity,
-                                       Demographic Parity, Counterfactual Fairness
+    4. Additional fairness metrics   — HR gap, Demographic Parity,
+                                       Counterfactual Fairness
     5. Path fairness metrics         — path type distribution, cross-genre access,
                                        path length fairness, path score KS
 """
@@ -177,25 +177,57 @@ def _build_item_score_tables(results, gender_map, k,
     return items, y_d, y_a, r_d, r_a
 
 
-def differential_fairness(results, gender_map, k, disadv="F", adv="M", eps=1e-9):
-    """
-    Differential Fairness (DF).
+def differential_fairness(results, gender_map, k, disadv="F", adv="M", alpha=1.0):
+    from collections import Counter
+    import math
+    import numpy as np
 
-    ε = mean_item |log P(rec | adv) - log P(rec | disadv)|
-    Perfect fairness = ε = 0; smaller is fairer.
+    group_counts = {
+        disadv: Counter(),
+        adv: Counter(),
+    }
 
-    Matches ILAP reference: epsilon_values.mean() (not max).
-    """
-    items, y_d, y_a, _, _ = _build_item_score_tables(
-        results, gender_map, k, disadv, adv)
+    group_users = {
+        disadv: 0,
+        adv: 0,
+    }
 
-    if not items:
+    all_items = set()
+
+    for res in results:
+        user = res["user"]
+        g = gender_map.get(user)
+
+        if g not in (disadv, adv):
+            continue
+
+        group_users[g] += 1
+
+        recs = res.get("top_k_recs", [])[:k]
+        group_counts[g].update(recs)
+        all_items.update(recs)
+
+    if not all_items:
         return 0.0
 
+    total_d = group_users[disadv] * k
+    total_a = group_users[adv] * k
+
+    if total_d == 0 or total_a == 0:
+        return 0.0
+
+    n_items = len(all_items)
+
     epsilons = []
-    for item in items:
-        p_d = max(y_d[item], eps)
-        p_a = max(y_a[item], eps)
+
+    for item in all_items:
+        p_d = (group_counts[disadv][item] + alpha) / (
+            total_d + alpha * n_items
+        )
+        p_a = (group_counts[adv][item] + alpha) / (
+            total_a + alpha * n_items
+        )
+
         epsilons.append(abs(math.log(p_d) - math.log(p_a)))
 
     return float(np.mean(epsilons))
@@ -395,16 +427,6 @@ def print_ilap_report(ilap_dict, k=10, label="Model"):
 # 4. Additional Fairness Metrics
 # ══════════════════════════════════════════════════════════════════════════════
 
-def disparate_impact(group_metrics, k):
-    """
-    min(HR_M, HR_F) / max(HR_M, HR_F).  Target ≥ 0.8 (80% rule).
-    """
-    hr_m = group_metrics["M"][k]["HR"]
-    hr_f = group_metrics["F"][k]["HR"]
-    denom = max(hr_m, hr_f)
-    return min(hr_m, hr_f) / denom if denom > 0 else 1.0
-
-
 def equalized_opportunity(group_metrics, k):
     """|HR_M@K − HR_F@K|.  Target ≈ 0."""
     return abs(group_metrics["M"][k]["HR"] - group_metrics["F"][k]["HR"])
@@ -488,44 +510,91 @@ def counterfactual_fairness_score(results, gender_map, adj, k):
 
 def print_additional_fairness_report(results, group_metrics, gender_map,
                                      adj, k_values=(5, 10), label="Model"):
+    """Print a compact group-level fairness summary.
+
+    ILAP metrics are the main fairness block in this project. This report is
+    intentionally short and avoids extra threshold-based metrics.
+    """
     print(f"\n{'─'*50}")
-    print(f"Additional Fairness Metrics — {label}")
+    print(f"Group-level Fairness Summary — {label}")
     print(f"{'─'*50}")
-    print(f"  {'K':>3} | {'ΔHR':>7} | {'ΔMRR':>7} | {'ΔNDCG':>8} | "
-          f"{'DI':>8} | {'EqOpp':>8} | {'DP':>8} | {'CF':>8}")
-    print(f"  {'-'*72}")
+    print(f"  {'K':>3} | {'HR_M':>7} | {'HR_F':>7} | {'HR Gap':>7} | "
+          f"{'DP':>8} | {'CF':>8}")
+    print(f"  {'-'*58}")
     for k in k_values:
         gm, gf = group_metrics["M"][k], group_metrics["F"][k]
-        dhr    = abs(gm["HR"]   - gf["HR"])
-        dmrr   = abs(gm["MRR"]  - gf["MRR"])
-        dndcg  = abs(gm["NDCG"] - gf["NDCG"])
-        di     = disparate_impact(group_metrics, k)
-        eo     = equalized_opportunity(group_metrics, k)
+        dhr    = abs(gm["HR"] - gf["HR"])
         dp     = demographic_parity(results, gender_map, k)
         cf, _  = counterfactual_fairness_score(results, gender_map, adj, k)
-        print(f"  {k:>3} | {dhr:>7.4f} | {dmrr:>7.4f} | {dndcg:>8.4f} | "
-              f"{di:>8.4f} | {eo:>8.4f} | {dp:>8.4f} | {cf:>8.4f}")
-        di_flag = "PASS" if di >= 0.8 else "FAIL"
-        print(f"  {'':>3}   DI {di_flag} (≥0.8 required)")
+        print(f"  {k:>3} | {gm['HR']:>7.4f} | {gf['HR']:>7.4f} | {dhr:>7.4f} | "
+              f"{dp:>8.4f} | {cf:>8.4f}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. Path Fairness Metrics  (novel KG-specific contribution)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def path_type_distribution(results, gender_map, disadv="F", adv="M"):
+def _safe_entropy_from_counts(counter):
+    """Entropy of a Counter as a simple explanation-diversity score."""
+    total = sum(counter.values())
+    if total <= 0:
+        return 0.0
+    probs = [c / total for c in counter.values() if c > 0]
+    return float(-sum(p * math.log(p) for p in probs))
+
+
+def path_type_counter(results, k=None):
     """
-    For each gender group, compute what fraction of recommendation paths
-    use each relation type as the first KG hop (index 1 in the path list).
+    Count explanation path types from the stored ``pattern_types`` field.
 
-    Reveals which relation types are gender-skewed.
+    This is preferable to reading the first relation in the raw path, because
+    most recommendation paths start with ``User -> likes``. The meaningful
+    explanation type is the extracted pattern type: genre/director/cf/cast/writer.
+    """
+    counter = Counter()
+    for res in results:
+        pts = res.get("pattern_types", [])
+        if k is not None:
+            pts = pts[:k]
+        counter.update([pt for pt in pts if pt])
+    return counter
 
-    Args:
-        results: list of dicts with key 'paths' (list of path token lists)
-                 and 'user'
 
-    Returns:
-        dist: dict {gender: Counter of relation → fraction}
+def path_diversity_summary(results, k=10):
+    """
+    Summarize explanation diversity for the top-K recommendations.
+
+    Returns dominant path type, dominant path ratio, entropy and raw counts.
+    Higher entropy and lower dominant ratio mean less explanation concentration.
+    """
+    counter = path_type_counter(results, k=k)
+    total = sum(counter.values())
+    if total == 0:
+        return {
+            "total": 0,
+            "dominant_type": None,
+            "dominant_ratio": 0.0,
+            "entropy": 0.0,
+            "counts": counter,
+        }
+    dominant_type, dominant_count = counter.most_common(1)[0]
+    return {
+        "total": total,
+        "dominant_type": dominant_type,
+        "dominant_ratio": float(dominant_count / total),
+        "entropy": _safe_entropy_from_counts(counter),
+        "counts": counter,
+    }
+
+
+def path_type_distribution(results, gender_map, disadv="F", adv="M", k=None):
+    """
+    For each gender group, compute the fraction of recommendation explanation
+    path types (genre/director/cf/cast/writer) in the top-K list.
+
+    Important: this uses ``result['pattern_types']`` instead of raw path[1],
+    because raw paths usually begin with ``likes`` and would hide the actual
+    explanation type.
     """
     rel_counts = {"M": Counter(), "F": Counter()}
 
@@ -533,10 +602,10 @@ def path_type_distribution(results, gender_map, disadv="F", adv="M"):
         g = gender_map.get(res["user"])
         if g not in ("M", "F"):
             continue
-        for path in res.get("paths", []):
-            if len(path) >= 2:
-                first_rel = path[1]   # User → [first_rel] → ...
-                rel_counts[g][first_rel] += 1
+        pts = res.get("pattern_types", [])
+        if k is not None:
+            pts = pts[:k]
+        rel_counts[g].update([pt for pt in pts if pt])
 
     dist = {}
     for g in ("M", "F"):
@@ -545,6 +614,22 @@ def path_type_distribution(results, gender_map, disadv="F", adv="M"):
                    for rel, count in rel_counts[g].items()} if total else {}
 
     return dist
+
+
+def print_path_diversity_report(results, k=10, label="Model"):
+    """Print overall explanation path diversity for a result list."""
+    summary = path_diversity_summary(results, k=k)
+    print(f"\n{'─'*50}")
+    print(f"Path-Type Diversity — {label} @ K={k}")
+    print(f"{'─'*50}")
+    print(f"  Total explanations : {summary['total']}")
+    print(f"  Dominant type      : {summary['dominant_type']}")
+    print(f"  Dominant ratio     : {summary['dominant_ratio']:.4f}")
+    print(f"  Path entropy       : {summary['entropy']:.4f}")
+    print("\n  Distribution:")
+    total = max(1, summary['total'])
+    for typ, cnt in summary['counts'].most_common():
+        print(f"    {typ:<12} {cnt:>6} ({cnt / total * 100:>5.1f}%)")
 
 
 def cross_genre_access(results, gender_map, adj, genre_key="hasGenre",
@@ -692,10 +777,10 @@ def print_path_fairness_report(results, gender_map, adj, k=10, label="Model"):
     print(f"    Gap    : {pl['gap']:.2f}")
 
     # Path type distribution
-    dist = path_type_distribution(results, gender_map)
+    dist = path_type_distribution(results, gender_map, k=k)
     all_rels = sorted(set(dist["M"]) | set(dist["F"]))
     if all_rels:
-        print(f"\n  Path Type Distribution (first hop):")
+        print(f"\n  Path Type Distribution (explanation pattern):")
         print(f"    {'Relation':<25} {'Male':>8} {'Female':>8} {'Gap':>8}")
         print(f"    {'-'*52}")
         for rel in all_rels:

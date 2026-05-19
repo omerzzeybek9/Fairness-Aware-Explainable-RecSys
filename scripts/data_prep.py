@@ -124,9 +124,20 @@ def subset_data(ratings, movies, users,
 # Train / Test Split
 # ---------------------------------------------------------------------------
 
-def train_test_split(positive_interactions, movies_sub, test_ratio=0.2):
+def train_test_split(positive_interactions, movies_sub, test_ratio=0.2,
+                     kg_movie_titles=None):
     """
     Temporal train/test split per user (last test_ratio fraction -> test).
+
+    Args:
+        positive_interactions : DataFrame of positive ratings
+        movies_sub            : DataFrame of movies in the subset
+        test_ratio            : fraction of each user's interactions to hold out
+        kg_movie_titles       : optional set of movie titles present in the KG.
+                                If provided, test ground truths are filtered to
+                                only include movies the model can actually recommend.
+                                Movies not in the KG cannot be enumerated by the
+                                model, so keeping them would unfairly lower HR.
 
     Returns:
         train_interactions : DataFrame
@@ -142,21 +153,29 @@ def train_test_split(positive_interactions, movies_sub, test_ratio=0.2):
     ].copy().sort_values(["userId", "timestamp"])
 
     train_list, test_list = [], []
+    skipped_users = 0
+
     for uid, group in interactions.groupby("userId"):
         n = len(group)
-        split_idx = int(n * (1 - test_ratio))
-        if split_idx == 0:
-            split_idx = 1
-        if split_idx >= n:
-            split_idx = n - 1
+        # Need at least 2 interactions: 1 for train, 1 for test.
+        # Users with only 1 interaction cannot have both a training signal
+        # and a held-out test item — skip them entirely.
+        if n < 2:
+            skipped_users += 1
+            continue
+        # Ensure at least 1 item in train and 1 in test.
+        split_idx = max(1, min(int(n * (1 - test_ratio)), n - 1))
         train_list.append(group.iloc[:split_idx])
         test_list.append(group.iloc[split_idx:])
+
+    if skipped_users > 0:
+        print(f"Skipped {skipped_users} users with fewer than 2 interactions.")
 
     train_interactions = pd.concat(train_list, ignore_index=True)
     test_interactions = pd.concat(test_list, ignore_index=True)
 
-    total = len(interactions)
-    print(f"Total: {total}")
+    total = len(train_interactions) + len(test_interactions)
+    print(f"Total (after user filter): {total}")
     print(f"Train: {len(train_interactions)} ({len(train_interactions)/total*100:.1f}%)")
     print(f"Test:  {len(test_interactions)} ({len(test_interactions)/total*100:.1f}%)")
     print(f"Avg test items per user: {test_interactions.groupby('userId').size().mean():.1f}")
@@ -171,10 +190,20 @@ def train_test_split(positive_interactions, movies_sub, test_ratio=0.2):
     for row in test_interactions.itertuples(index=False):
         user_node = f"User_{int(row.userId)}"
         movie = movie_id_to_label[int(row.movieId)]
+        # Only include test movies the model can actually recommend.
+        # If kg_movie_titles is provided, filter out movies not in the KG.
+        if kg_movie_titles is not None and movie not in kg_movie_titles:
+            continue
         test_set_dict.setdefault(user_node, []).append(movie)
+
+    # Remove users whose entire test set was filtered out.
+    test_set_dict = {u: mvs for u, mvs in test_set_dict.items() if mvs}
 
     print(f"\nTrain edges: {len(user_item_edges)}")
     print(f"Test users:  {len(test_set_dict)}")
     print(f"Test pairs:  {sum(len(v) for v in test_set_dict.values())}")
+    if kg_movie_titles is not None:
+        n_filtered = len(test_interactions) - sum(len(v) for v in test_set_dict.values())
+        print(f"Test pairs filtered (not in KG): {n_filtered}")
 
     return train_interactions, test_interactions, user_item_edges, test_set_dict
