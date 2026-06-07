@@ -1,3 +1,10 @@
+"""
+paths.py — KG path sampling for PGPR training data generation.
+
+Usage:
+    from paths import sample_guided_paths, path_is_faithful, is_relation
+"""
+
 import random
 
 from kg_builder import BASE_RELS
@@ -8,6 +15,7 @@ def is_relation(tok):
 
 
 def path_is_faithful(path, adj):
+    """Verify every (h, r, t) triple in the path exists in adj."""
     for i in range(0, len(path) - 2, 2):
         h, r, t = path[i], path[i + 1], path[i + 2]
         if t not in adj[h].get(r, set()):
@@ -15,8 +23,10 @@ def path_is_faithful(path, adj):
     return True
 
 
+# ── Individual path samplers ───────────────────────────────────────────────────
 
 def sample_genre_path(user_node, adj):
+    """User → likes → MovieA → hasGenre → Genre → rev_hasGenre → MovieB"""
     liked = list(adj[user_node].get("likes", set()))
     if not liked:
         return None
@@ -33,6 +43,7 @@ def sample_genre_path(user_node, adj):
 
 
 def sample_director_path(user_node, adj):
+    """User → likes → MovieA → directedBy → Director → rev_directedBy → MovieB"""
     liked = list(adj[user_node].get("likes", set()))
     if not liked:
         return None
@@ -49,6 +60,7 @@ def sample_director_path(user_node, adj):
 
 
 def sample_cf_path(user_node, adj):
+    """User → likes → MovieA → rev_likes → UserB → likes → MovieB"""
     liked = list(adj[user_node].get("likes", set()))
     if not liked:
         return None
@@ -65,6 +77,7 @@ def sample_cf_path(user_node, adj):
 
 
 def sample_cast_path(user_node, adj):
+    """User → likes → MovieA → hasCast → Actor → rev_hasCast → MovieB"""
     liked = list(adj[user_node].get("likes", set()))
     if not liked:
         return None
@@ -81,6 +94,7 @@ def sample_cast_path(user_node, adj):
 
 
 def sample_composer_path(user_node, adj):
+    """User → likes → MovieA → hasComposer → Composer → rev_hasComposer → MovieB"""
     liked = list(adj[user_node].get("likes", set()))
     if not liked:
         return None
@@ -97,6 +111,7 @@ def sample_composer_path(user_node, adj):
 
 
 def sample_writer_path(user_node, adj):
+    """User → likes → MovieA → writtenBy → Writer → rev_writtenBy → MovieB"""
     liked = list(adj[user_node].get("likes", set()))
     if not liked:
         return None
@@ -114,6 +129,7 @@ def sample_writer_path(user_node, adj):
 
 
 def sample_producer_path(user_node, adj):
+    """User → likes → MovieA → hasProducer → Producer → rev_hasProducer → MovieB"""
     liked = list(adj[user_node].get("likes", set()))
     if not liked:
         return None
@@ -130,6 +146,7 @@ def sample_producer_path(user_node, adj):
 
 
 def sample_cinematographer_path(user_node, adj):
+    """User → likes → MovieA → hasCinematographer → DP → rev_hasCinematographer → MovieB"""
     liked = list(adj[user_node].get("likes", set()))
     if not liked:
         return None
@@ -144,6 +161,12 @@ def sample_cinematographer_path(user_node, adj):
     movie_b = random.choice(candidates)
     return [user_node, "likes", movie_a, "hasCinematographer", dp, "rev_hasCinematographer", movie_b]
 
+# ── Main sampling function ─────────────────────────────────────────────────────
+
+# Composer is excluded from the default pattern set: ML-100K's KG is too
+# sparse in composer information for it to be a reliable explanation type.
+# The remaining five patterns are sampled uniformly to avoid biasing the
+# model towards any single explanation type.
 DEFAULT_PATTERN_WEIGHTS = {
     "genre":           0.20,
     "director":        0.20,
@@ -168,6 +191,19 @@ _SAMPLERS = {
 
 def sample_guided_paths(users, adj, paths_per_user=150,
                         pattern_weights=None, deduplicate=True):
+    """
+    Sample KG paths for a list of users.
+
+    Args:
+        users:            list of user node strings (e.g. ['User_1', ...])
+        adj:              KG adjacency dict  adj[node][relation] = set(tails)
+        paths_per_user:   number of path attempts per user
+        pattern_weights:  dict of pattern_name → sampling weight
+        deduplicate:      remove duplicate paths
+
+    Returns:
+        list of paths, each path is a list of tokens
+    """
     if pattern_weights is None:
         pattern_weights = DEFAULT_PATTERN_WEIGHTS
 

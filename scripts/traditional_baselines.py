@@ -1,3 +1,43 @@
+"""
+traditional_baselines.py — Three classic recommendation baselines for comparison.
+
+    1. User-Based Collaborative Filtering (UserCF)
+    2. Matrix Factorization via SVD  (SVD-MF)
+    3. Multi-Layer Perceptron Neural CF  (MLP-CF)
+
+Each function returns results in the same dict format as the GPT-2 models so they
+can be evaluated directly with evaluate_ranking / compute_group_metrics / ILAP.
+
+Output format per user:
+    {
+      "user":          "User_<id>",
+      "ground_truths": [movie_title, ...],
+      "top_k_recs":    [movie_title, ...],   # top-K recommended titles
+      "pattern_types": ["cf"] * len(recs),   # placeholder (no path patterns)
+      "paths":         [[]]  * len(recs),    # placeholder
+      "num_gt":        int,
+    }
+
+Usage (in notebook):
+    import importlib
+    import scripts.traditional_baselines as tb
+    importlib.reload(tb)
+
+    results_ucf, results_svd, results_mlp = tb.run_all(
+        train_interactions, test_set_dict, movies_sub, k=10, seed=42,
+    )
+    tb.compare_all(
+        {
+          "GPT-2 (Ours)":  results,
+          "GPT-2+Gender":  results_gender,
+          "UserCF":        results_ucf,
+          "SVD-MF":        results_svd,
+          "MLP-CF":        results_mlp,
+        },
+        user_gender_map, k_values=K_VALUES,
+    )
+"""
+
 import random
 import math
 from collections import defaultdict
@@ -13,7 +53,19 @@ from metrics import (
     compute_all_ilap_metrics, print_ilap_report
 )
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Shared helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
 def _build_index_maps(train_interactions, movies_sub):
+    """
+    Return mappings:
+        uid2idx   : userId (int) -> matrix row index
+        mid2idx   : movieId (int) -> matrix col index
+        idx2title : col index -> movie title string
+        title2mid : movie title -> movieId
+    """
     user_ids  = sorted(train_interactions["userId"].unique())
     movie_ids = sorted(movies_sub["movieId"].unique())
 
@@ -29,6 +81,7 @@ def _build_index_maps(train_interactions, movies_sub):
 
 
 def _build_interaction_matrix(train_interactions, uid2idx, mid2idx):
+    """Build binary user-item matrix (n_users x n_items)."""
     n_users = len(uid2idx)
     n_items = len(mid2idx)
     mat = np.zeros((n_users, n_items), dtype=np.float32)
@@ -41,10 +94,12 @@ def _build_interaction_matrix(train_interactions, uid2idx, mid2idx):
 
 
 def _user_node_to_id(user_node):
+    """'User_42' -> 42"""
     return int(user_node.split("_")[1])
 
 
 def _pack_results(user_node, ground_truths, recs):
+    """Wrap recommendations into the standard result dict."""
     return {
         "user":          user_node,
         "ground_truths": ground_truths,
@@ -55,8 +110,32 @@ def _pack_results(user_node, ground_truths, recs):
     }
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. User-Based Collaborative Filtering
+# ══════════════════════════════════════════════════════════════════════════════
+
 def run_user_cf(train_interactions, test_set_dict, movies_sub,
                 k=10, n_neighbors=20, seed=42):
+    """
+    User-Based Collaborative Filtering.
+
+    Computes cosine similarity between every pair of users based on their
+    binary interaction vectors, then scores unseen items by a weighted vote
+    from the top-n_neighbors most similar users.
+
+    Parameters
+    ----------
+    train_interactions : DataFrame  columns: userId, movieId
+    test_set_dict      : dict       {"User_<id>" -> [ground_truth_titles]}
+    movies_sub         : DataFrame  columns: movieId, title
+    k                  : int        top-K recommendations
+    n_neighbors        : int        number of nearest neighbours to use
+    seed               : int        (unused, kept for API consistency)
+
+    Returns
+    -------
+    list of result dicts
+    """
     random.seed(seed)
     np.random.seed(seed)
 
@@ -69,10 +148,12 @@ def run_user_cf(train_interactions, test_set_dict, movies_sub,
 
     mat = _build_interaction_matrix(train_interactions, uid2idx, mid2idx)
 
+    # Cosine similarity:  (n_users x n_users)
+    # Normalise rows to unit length first
     norms = np.linalg.norm(mat, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     mat_norm = mat / norms
-    sim = mat_norm @ mat_norm.T          
+    sim = mat_norm @ mat_norm.T          # (n_users, n_users)
 
     results = []
     for user_node, ground_truths in tqdm(test_set_dict.items(), desc="UserCF"):
@@ -83,11 +164,13 @@ def run_user_cf(train_interactions, test_set_dict, movies_sub,
 
         u_idx = uid2idx[uid]
         sims  = sim[u_idx].copy()
-        sims[u_idx] = -1          
+        sims[u_idx] = -1          # exclude self
 
+        # Top-n_neighbors
         nn_idx = np.argpartition(sims, -n_neighbors)[-n_neighbors:]
         nn_idx = nn_idx[np.argsort(sims[nn_idx])[::-1]]
 
+        # Score items: weighted vote
         seen = set(np.where(mat[u_idx] > 0)[0])
         scores = defaultdict(float)
         for nb in nn_idx:
@@ -106,9 +189,27 @@ def run_user_cf(train_interactions, test_set_dict, movies_sub,
     return results
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. Matrix Factorization via SVD
+# ══════════════════════════════════════════════════════════════════════════════
+
 def run_svd_mf(train_interactions, test_set_dict, movies_sub,
                k=10, n_factors=50, n_epochs=20, lr=0.01,
                reg=0.01, seed=42):
+    """
+    Matrix Factorization trained with gradient descent (BPR-style).
+
+    Learns latent user/item factors P (n_users x d) and Q (n_items x d).
+    Score(u, i) = P[u] . Q[i]
+    Optimised with BPR loss on positive-negative pairs.
+
+    Parameters
+    ----------
+    n_factors : int   latent dimension
+    n_epochs  : int   training epochs
+    lr        : float learning rate
+    reg       : float L2 regularisation weight
+    """
     random.seed(seed)
     np.random.seed(seed)
 
@@ -122,9 +223,11 @@ def run_svd_mf(train_interactions, test_set_dict, movies_sub,
     n_users = len(uid2idx)
     n_items = len(mid2idx)
 
+    # Initialise factors
     P = np.random.normal(0, 0.01, (n_users, n_factors)).astype(np.float32)
     Q = np.random.normal(0, 0.01, (n_items, n_factors)).astype(np.float32)
 
+    # Build per-user positive item lists for BPR sampling
     user_pos = defaultdict(list)
     for _, row in train_interactions.iterrows():
         u = uid2idx.get(int(row["userId"]))
@@ -134,15 +237,18 @@ def run_svd_mf(train_interactions, test_set_dict, movies_sub,
 
     item_set = list(range(n_items))
 
+    # BPR training
     for epoch in range(n_epochs):
         total_loss = 0.0
         n_samples  = 0
         for u, pos_items in user_pos.items():
             for pos in pos_items:
+                # Sample a negative item
                 neg = random.choice(item_set)
                 while neg in user_pos[u]:
                     neg = random.choice(item_set)
 
+                # BPR gradient
                 diff = float(np.dot(P[u], Q[pos] - Q[neg]))
                 grad = -1.0 / (1.0 + math.exp(diff)) if diff < 50 else -math.exp(-diff)
 
@@ -156,9 +262,11 @@ def run_svd_mf(train_interactions, test_set_dict, movies_sub,
         if (epoch + 1) % 5 == 0:
             print(f"  Epoch {epoch+1}/{n_epochs}  BPR loss: {total_loss/max(n_samples,1):.4f}")
 
+    # Build binary seen matrix for filtering
     mat = _build_interaction_matrix(train_interactions, uid2idx, mid2idx)
 
-    scores_all = P @ Q.T 
+    # Score all items for each test user
+    scores_all = P @ Q.T   # (n_users, n_items)
 
     results = []
     for user_node, ground_truths in tqdm(test_set_dict.items(), desc="SVD-MF"):
@@ -170,6 +278,7 @@ def run_svd_mf(train_interactions, test_set_dict, movies_sub,
         u_idx  = uid2idx[uid]
         scores = scores_all[u_idx].copy()
 
+        # Zero out already-seen items
         seen_mask = mat[u_idx] > 0
         scores[seen_mask] = -np.inf
 
@@ -181,6 +290,10 @@ def run_svd_mf(train_interactions, test_set_dict, movies_sub,
 
     return results
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. MLP Neural Collaborative Filtering
+# ══════════════════════════════════════════════════════════════════════════════
 
 class _MLPModel(nn.Module):
     def __init__(self, n_users, n_items, n_factors=32, hidden=(64, 32)):
@@ -210,7 +323,20 @@ def run_mlp_cf(train_interactions, test_set_dict, movies_sub,
                k=10, n_factors=32, hidden=(64, 32),
                n_epochs=20, lr=1e-3, batch_size=512,
                neg_ratio=4, seed=42, device="cpu"):
+    """
+    MLP Neural Collaborative Filtering.
 
+    Trains user/item embeddings + MLP layers to predict interaction scores.
+    Trained with BCE loss using sampled negatives (neg_ratio per positive).
+
+    Parameters
+    ----------
+    n_factors  : int    embedding dimension
+    hidden     : tuple  hidden layer sizes
+    n_epochs   : int    training epochs
+    batch_size : int    mini-batch size
+    neg_ratio  : int    negatives per positive sample
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -225,6 +351,7 @@ def run_mlp_cf(train_interactions, test_set_dict, movies_sub,
     n_users = len(uid2idx)
     n_items = len(mid2idx)
 
+    # Build positive pairs
     pos_pairs = []
     user_pos  = defaultdict(set)
     for _, row in train_interactions.iterrows():
@@ -236,6 +363,7 @@ def run_mlp_cf(train_interactions, test_set_dict, movies_sub,
 
     item_list = list(range(n_items))
 
+    # Build training data with negatives
     def _build_dataset():
         users, items, labels = [], [], []
         for u, m in pos_pairs:
@@ -282,8 +410,10 @@ def run_mlp_cf(train_interactions, test_set_dict, movies_sub,
         if (epoch + 1) % 5 == 0:
             print(f"  Epoch {epoch+1}/{n_epochs}  BCE loss: {total_loss/max(n_batches,1):.4f}")
 
+    # Build binary seen matrix for filtering
     mat = _build_interaction_matrix(train_interactions, uid2idx, mid2idx)
 
+    # Pre-compute scores for all users x items in batches
     model_mlp.eval()
     all_item_idx = torch.arange(n_items, dtype=torch.long).to(device)
 
@@ -313,11 +443,22 @@ def run_mlp_cf(train_interactions, test_set_dict, movies_sub,
     return results
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Convenience: run all three baselines at once
+# ══════════════════════════════════════════════════════════════════════════════
+
 def run_all(train_interactions, test_set_dict, movies_sub,
             k=10, seed=42, device="cpu",
             ucf_neighbors=20,
             svd_factors=50, svd_epochs=20,
             mlp_factors=32, mlp_epochs=20):
+    """
+    Run UserCF, SVD-MF, MLP-CF sequentially and return their result lists.
+
+    Returns
+    -------
+    results_ucf, results_svd, results_mlp
+    """
     results_ucf = run_user_cf(
         train_interactions, test_set_dict, movies_sub,
         k=k, n_neighbors=ucf_neighbors, seed=seed,
@@ -334,8 +475,28 @@ def run_all(train_interactions, test_set_dict, movies_sub,
     return results_ucf, results_svd, results_mlp
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Unified comparison table
+# ══════════════════════════════════════════════════════════════════════════════
 
 def compare_all(models_dict, user_gender_map, adj=None, k_values=(1, 3, 5, 10)):
+    """
+    Print a unified accuracy + fairness comparison table for all models.
+
+    Parameters
+    ----------
+    models_dict     : dict  {model_label: results_list}
+    user_gender_map : dict  {"User_<id>" -> 'M'/'F'}
+    adj             : dict  KG adjacency (needed for CF score; pass None to skip)
+    k_values        : tuple cutoff values
+
+    Example
+    -------
+    compare_all(
+        {"GPT-2": results, "UserCF": results_ucf, ...},
+        user_gender_map, adj=adj,
+    )
+    """
     k10 = 10
     sep = "=" * 100
 
@@ -343,6 +504,7 @@ def compare_all(models_dict, user_gender_map, adj=None, k_values=(1, 3, 5, 10)):
     print(f"  MODEL COMPARISON — Accuracy & Fairness @ K={k10}")
     print(sep)
 
+    # Header
     print(f"\n{'Model':<18} {'HR@10':>7} {'MRR@10':>7} {'NDCG@10':>8} "
           f"{'HR_M':>7} {'HR_F':>7} {'Gap':>7} "
           f"{'DI':>7} {'EO':>7} {'DP':>7} {'CF':>7}")
@@ -367,6 +529,7 @@ def compare_all(models_dict, user_gender_map, adj=None, k_values=(1, 3, 5, 10)):
 
     print(sep)
 
+    # Per-K accuracy table
     print(f"\n{'Model':<18}", end="")
     for k in k_values:
         print(f"  HR@{k:>2}", end="")
@@ -385,6 +548,7 @@ def compare_all(models_dict, user_gender_map, adj=None, k_values=(1, 3, 5, 10)):
 
     print()
 
+    # ILAP table
     print(f"\n{'ILAP Fairness @ K=10':^60}")
     print("-" * 60)
     ilap_all = {

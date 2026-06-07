@@ -1,9 +1,26 @@
+"""
+visualizations.py — Publication-quality comparison plots for all models.
+
+Usage (in notebook):
+    import importlib
+    import scripts.visualizations as viz
+    importlib.reload(viz)
+
+    models = {
+        "GPT-2 (Ours)": (results,        ranking_metrics,        group_metrics),
+        "GPT-2+Gender": (results_gender,  ranking_metrics_gender, group_metrics_gender),
+    }
+
+    viz.plot_all(models, k_values=K_VALUES, save_dir="figures")
+"""
+
 import os
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from metrics import evaluate_ranking, disparate_impact
 
+# ── Style ──────────────────────────────────────────────────────────────────────
 
 MODEL_COLORS = {
     "GPT-2 (Ours)":  "#2ecc71",
@@ -23,9 +40,26 @@ plt.rcParams.update({
 })
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Public entry point
+# ══════════════════════════════════════════════════════════════════════════════
+
 def plot_all(models, k_values=(1, 3, 5, 10), save_dir="figures",
              ilap_scores=None, fairness_scores=None):
+    """
+    Generate all comparison plots and save to save_dir.
 
+    Parameters
+    ----------
+    models : dict
+        {model_label: (results_list, ranking_metrics_dict, group_metrics_dict)}
+        ranking_metrics_dict  = evaluate_ranking(results, k_values)
+        group_metrics_dict    = compute_group_metrics(results, user_gender_map, k_values)
+    k_values     : tuple
+    save_dir     : str   folder to save figures (created if missing)
+    ilap_scores     : dict  optional {model_label: ilap_dict}
+    fairness_scores : dict  optional {model_label: {"DI","EO","DP","CF"}}
+    """
     os.makedirs(save_dir, exist_ok=True)
 
     _plot_metric_at_k(models, k_values, save_dir)
@@ -42,7 +76,12 @@ def plot_all(models, k_values=(1, 3, 5, 10), save_dir="figures",
     print(f"All figures saved to '{save_dir}/'")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Figure 1 — HR / MRR / NDCG @ K for each model (3-panel bar chart)
+# ══════════════════════════════════════════════════════════════════════════════
+
 def _plot_metric_at_k(models, k_values, save_dir):
+    """3 subplots: HR@K, MRR@K, NDCG@K — one grouped bar cluster per model."""
     metric_names = ["HR", "MRR", "NDCG"]
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     fig.suptitle("Recommendation Performance Across K Values", fontsize=14, fontweight="bold")
@@ -79,6 +118,10 @@ def _plot_metric_at_k(models, k_values, save_dir):
     print(f"  Saved: {path}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Figure 2 — Side-by-side bar: HR@10, MRR@10, NDCG@10 per model
+# ══════════════════════════════════════════════════════════════════════════════
+
 def _plot_comparison_at_k(models, k, save_dir):
     """Clean bar chart: one bar per model per metric at a fixed K."""
     metric_names = ["HR", "MRR", "NDCG"]
@@ -107,6 +150,9 @@ def _plot_comparison_at_k(models, k, save_dir):
     print(f"  Saved: {path}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Figure 3 — Gender breakdown: Male vs Female HR@10 per model
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _plot_gender_breakdown(models, k, save_dir):
     """Grouped bars: M and F HR@K side-by-side for every model."""
@@ -144,7 +190,12 @@ def _plot_gender_breakdown(models, k, save_dir):
     print(f"  Saved: {path}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Figure 4 — Fairness gap: |HR_M − HR_F| and Disparate Impact per model
+# ══════════════════════════════════════════════════════════════════════════════
+
 def _plot_fairness_gap(models, k_values, save_dir):
+    """Two panels: absolute HR gap and Disparate Impact for K=10."""
     k = 10
     labels = list(models.keys())
     colors = [MODEL_COLORS.get(l, f"C{i}") for i, l in enumerate(labels)]
@@ -161,6 +212,7 @@ def _plot_fairness_gap(models, k_values, save_dir):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     fig.suptitle(f"Fairness Comparison at K={k}", fontsize=14, fontweight="bold")
 
+    # Panel 1 — HR gap (lower is fairer)
     bars = ax1.bar(labels, gaps, color=colors, alpha=0.88)
     for bar, v in zip(bars, gaps):
         ax1.text(bar.get_x() + bar.get_width() / 2, v + 0.001,
@@ -170,6 +222,7 @@ def _plot_fairness_gap(models, k_values, save_dir):
     ax1.set_ylim(0, max(gaps) * 1.3 if max(gaps) > 0 else 0.1)
     ax1.tick_params(axis="x", rotation=15)
 
+    # Panel 2 — Disparate Impact (≥ 0.8 = fair threshold)
     bars2 = ax2.bar(labels, dis, color=colors, alpha=0.88)
     ax2.axhline(0.8, color="#e67e22", linestyle="--", linewidth=1.5,
                 label="Fair threshold (DI=0.8)")
@@ -190,6 +243,10 @@ def _plot_fairness_gap(models, k_values, save_dir):
     plt.show()
     print(f"  Saved: {path}")
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Figure 5 — HR@K line chart: all models across K values
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _plot_hr_k_lines(models, k_values, save_dir):
     """Line chart showing HR@K curve for each model."""
@@ -218,8 +275,12 @@ def _plot_hr_k_lines(models, k_values, save_dir):
     plt.show()
     print(f"  Saved: {path}")
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Figure 6 — ILAP fairness metrics bar chart across all models
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _plot_ilap_comparison(ilap_scores, save_dir):
+    """Bar chart comparing key ILAP fairness metrics across all models."""
     ilap_keys = ["DF", "VU", "AU", "NU", "GCE"]
     labels = list(ilap_scores.keys())
     colors = [MODEL_COLORS.get(l, f"C{i}") for i, l in enumerate(labels)]
@@ -259,6 +320,10 @@ def _plot_ilap_comparison(ilap_scores, save_dir):
     plt.show()
     print(f"  Saved: {path}")
 
+# =============================================================================
+# Figure 7 — DI / EO / DP / CF bar chart across all models
+# =============================================================================
+
 def _plot_fairness_metrics(fairness_scores, save_dir):
     metrics_def = [
         ("Disparate Impact",        "DI",  0.8,  ">=0.8 = fair"),
@@ -294,6 +359,10 @@ def _plot_fairness_metrics(fairness_scores, save_dir):
     plt.show()
     print("  Saved: {}".format(path))
 
+
+# =============================================================================
+# Figure 8 — Fairness heatmap: all metrics x all models
+# =============================================================================
 
 def _plot_fairness_heatmap(fairness_scores, ilap_scores, save_dir):
     labels = list(fairness_scores.keys())

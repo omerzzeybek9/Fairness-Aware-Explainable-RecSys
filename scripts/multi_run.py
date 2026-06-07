@@ -1,3 +1,21 @@
+"""
+multi_run.py — Run the full pipeline multiple times with different seeds
+and report mean ± std with statistical significance tests.
+
+Usage (in notebook):
+    import importlib
+    import scripts.multi_run as multi_run
+    importlib.reload(multi_run)
+
+    all_results = multi_run.run(
+        adj, all_users, test_set_dict, movie_titles_set,
+        user_gender_map, BASE_RELS, device,
+        paths_per_user=200, k_values=[1, 3, 5, 10],
+        seeds=[42, 123, 456, 789, 2024],
+    )
+    multi_run.report(all_results)
+"""
+
 import random
 import numpy as np
 from scipy import stats
@@ -18,7 +36,38 @@ def run(adj, all_users, test_set_dict, movie_titles_set,
         seeds=(42, 123, 456, 789, 2024),
         epochs=10, lr=3e-4, patience=2,
         pattern_weights=None):
-   
+    """
+    Run full pipeline once per seed. Returns list of per-run result dicts.
+
+    Parameters
+    ----------
+    adj              : KG adjacency graph
+    all_users        : list of training user node strings
+    test_set_dict    : dict {"User_<id>" -> [ground_truths]}
+    movie_titles_set : set of all valid movie title strings
+    user_gender_map  : dict {"User_<id>" -> 'M'/'F'}
+    base_rels        : set of base relation tokens
+    device           : torch.device
+    paths_per_user   : int
+    k_values         : tuple of cutoff values
+    seeds            : tuple of random seeds
+    epochs           : int training epochs per run
+    lr               : float learning rate
+    patience         : int early stopping patience
+    pattern_weights  : dict pattern→weight for path sampling (None = default 6-pattern set)
+
+    Returns
+    -------
+    list of dicts, one per seed:
+        {
+          "seed": int,
+          "results": list,
+          "ranking": {k: {HR, MRR, NDCG}},
+          "group":   {gender: {k: {HR, MRR, NDCG}}},
+          "ilap":    dict,
+          "DI": float, "EO": float, "DP": float, "CF": float,
+        }
+    """
     import torch
     all_runs = []
     k_eval = max(k_values)
@@ -37,18 +86,21 @@ def run(adj, all_users, test_set_dict, movie_titles_set,
         np.random.seed(seed)
         torch.manual_seed(seed)
 
+        # Sample paths
         paths = sample_guided_paths(
             users=all_users, adj=adj,
             paths_per_user=paths_per_user,
             pattern_weights=pattern_weights,
         )
 
+        # Build vocab & dataset
         vocab, id2tok, PAD, BOS, EOS, UNK = build_vocab(paths, base_rels)
         train_loader, val_loader, MAX_LEN, _ = create_path_dataset(
             paths, vocab, base_rels, PAD, BOS, EOS, UNK,
             batch_size=64, val_ratio=0.1,
         )
 
+        # Train
         model = create_model(
             vocab_size=len(vocab), max_len=MAX_LEN,
             BOS=BOS, EOS=EOS, device=device,
@@ -59,6 +111,7 @@ def run(adj, all_users, test_set_dict, movie_titles_set,
             epochs=epochs, lr=lr, patience=patience,
         )
 
+        # Evaluate
         results = []
         for user_node, ground_truths in tqdm(
             test_set_dict.items(), desc=f"Seed {seed} — evaluating"
@@ -97,6 +150,7 @@ def run(adj, all_users, test_set_dict, movie_titles_set,
         }
         all_runs.append(run_dict)
 
+        # Quick per-seed summary
         print(f"  HR@10={ranking[10]['HR']:.4f}  MRR@10={ranking[10]['MRR']:.4f}  "
               f"DI={run_dict['DI']:.4f}  Gap={group['F'][10]['HR']-group['M'][10]['HR']:+.4f}")
 
@@ -104,11 +158,21 @@ def run(adj, all_users, test_set_dict, movie_titles_set,
 
 
 def report(all_runs, k_values=(1, 3, 5, 10)):
+    """
+    Print mean ± std for all metrics and run t-tests against the
+    GPT-2+Gender baseline (if provided in all_runs as 'gender_runs').
+
+    Parameters
+    ----------
+    all_runs  : list of run dicts from run()
+    k_values  : tuple of cutoff values
+    """
     print("\n" + "="*70)
     print("  MULTI-RUN RESULTS")
     print(f"  {len(all_runs)} seeds: {[r['seed'] for r in all_runs]}")
     print("="*70)
 
+    # Accuracy metrics
     print(f"\n{'Metric':<14}", end="")
     for k in k_values:
         print(f"  {'@'+str(k):>10}", end="")
@@ -122,6 +186,7 @@ def report(all_runs, k_values=(1, 3, 5, 10)):
             print(f"  {np.mean(vals):.4f}±{np.std(vals):.4f}", end="")
         print()
 
+    # Gender breakdown at K=10
     print(f"\n{'Gender HR@10':<14}  {'Male':>12}  {'Female':>12}  {'Gap':>10}")
     print("-" * 54)
     male_hrs   = [r["group"]["M"][10]["HR"] for r in all_runs]
@@ -131,6 +196,7 @@ def report(all_runs, k_values=(1, 3, 5, 10)):
           f"{np.mean(female_hrs):.4f}±{np.std(female_hrs):.4f}  "
           f"{np.mean(gaps):+.4f}±{np.std(gaps):.4f}")
 
+    # Fairness metrics
     print(f"\n{'Metric':<8}  {'Mean':>10}  {'Std':>10}  {'Min':>10}  {'Max':>10}")
     print("-" * 54)
     for key in ["DI", "EO", "DP", "CF"]:
@@ -138,6 +204,7 @@ def report(all_runs, k_values=(1, 3, 5, 10)):
         print(f"{key:<8}  {np.mean(vals):>10.4f}  {np.std(vals):>10.4f}"
               f"  {np.min(vals):>10.4f}  {np.max(vals):>10.4f}")
 
+    # Per-run table
     print(f"\n{'Seed':>6}  {'HR@10':>8}  {'MRR@10':>8}  {'NDCG@10':>8}  "
           f"{'DI':>7}  {'Gap':>7}")
     print("-" * 56)
@@ -148,6 +215,7 @@ def report(all_runs, k_values=(1, 3, 5, 10)):
               f"{r['ranking'][10]['NDCG']:>8.4f}  "
               f"{r['DI']:>7.4f}  {gap:>+7.4f}")
 
+    # Statistical summary with t-distribution CI (correct for small N)
     hr_vals = [r["ranking"][10]["HR"] for r in all_runs]
     di_vals = [r["DI"] for r in all_runs]
     n = len(hr_vals)
@@ -174,6 +242,15 @@ def report(all_runs, k_values=(1, 3, 5, 10)):
 
 
 def compare(our_runs, gender_runs, k=10):
+    """
+    Paired t-test: GPT-2 (Ours) vs GPT-2+Gender across seeds.
+
+    Parameters
+    ----------
+    our_runs    : list of run dicts from run() for our model
+    gender_runs : list of run dicts from run() for GPT-2+Gender
+    k           : cutoff value
+    """
     print("\n" + "="*60)
     print("  STATISTICAL COMPARISON: GPT-2 (Ours) vs GPT-2+Gender")
     print("="*60)

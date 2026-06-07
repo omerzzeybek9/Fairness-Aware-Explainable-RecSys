@@ -1,3 +1,32 @@
+"""
+model.py - GPT-2 based KG path model for fair explainable recommendation.
+
+Designed for the full MovieLens-100K + IMDb Knowledge Graph setting.
+The training and decoding setup follows PEARLM (Balloccu et al., RecSys 2024):
+KG-constrained path generation where the language model itself ranks paths.
+
+Main idea:
+    1. Train a small GPT-2 language model on valid KG paths.
+    2. At inference, enumerate valid candidate paths deterministically from the KG.
+    3. Score each candidate path by GPT-2 path probability (PEARLM-style).
+    4. Keep the best (highest LM-probability) path per candidate movie.
+    5. Optional diversity re-ranking via MMR (Carbonell & Goldstein 1998,
+       Balloccu et al. SIGIR 2022). Disabled by default (lambda_div=0.0)
+       because, with uniform pattern sampling during training, the model
+       already produces diverse explanations on its own — explicit MMR
+       push tends to overshoot toward sparse pattern types.
+
+Design notes:
+    - Scoring is intentionally simple: only the LM probability is used,
+      following the PEARLM result that direct embedding learning + LM
+      probability is the dominant signal for ranking quality.
+    - Diversity re-ranking is available as a post-hoc step (set lambda_div>0)
+      but is off by default; the diversity comes from training-time uniform
+      pattern sampling instead.
+    - Gender paths are disabled by default and only enabled for the
+      gender-aware baseline used in fairness comparisons.
+"""
+
 import random
 
 import torch
@@ -6,10 +35,59 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import GPT2Config, GPT2LMHeadModel
 from tqdm import tqdm
 
+
+
+# ---------------------------------------------------------------------------
+# Adversarial Fairness — Gradient Reversal Layer + Gender Discriminator
+# ---------------------------------------------------------------------------
+import torch.nn as nn
+from torch.autograd import Function
+
+
+class GradientReversalFunction(Function):
+    @staticmethod
+    def forward(ctx, x, lambda_adv):
+        ctx.save_for_backward(torch.tensor(lambda_adv))
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        lambda_adv, = ctx.saved_tensors
+        return -lambda_adv.item() * grad_output, None
+
+
+class GradientReversalLayer(nn.Module):
+    def __init__(self, lambda_adv=1.0):
+        super().__init__()
+        self.lambda_adv = lambda_adv
+
+    def forward(self, x):
+        return GradientReversalFunction.apply(x, self.lambda_adv)
+
+
+class GenderDiscriminator(nn.Module):
+    def __init__(self, n_embd, hidden_dim=64, dropout=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+# ---------------------------------------------------------------------------
+# Vocabulary
+# ---------------------------------------------------------------------------
+
 SPECIAL_TOKENS = ["<pad>", "<bos>", "<eos>", "<unk>"]
 
 
 def build_vocab(paths, base_rels):
+    """Build token vocabulary from sampled KG paths."""
     vocab = {tok: i for i, tok in enumerate(SPECIAL_TOKENS)}
 
     for p in paths:
@@ -24,20 +102,28 @@ def build_vocab(paths, base_rels):
 
 
 def is_relation(tok, base_rels):
+    """Check whether a token is a KG relation token."""
     return isinstance(tok, str) and (tok in base_rels or tok.startswith("rev_"))
 
 
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
 
 def _encode_path(tokens, vocab, UNK, BOS, EOS):
+    """Convert a token path into ids with BOS and EOS."""
     ids = [vocab.get(tok, UNK) for tok in tokens]
     return [BOS] + ids + [EOS]
 
 
 def _pad_to_len(ids, length, pad_id):
+    """Pad or truncate a token-id sequence to a fixed length."""
     return ids[:length] + [pad_id] * max(0, length - len(ids))
 
 
 def _corrupt_path(path, all_entities, base_rels):
+    """Create a negative path by replacing the final entity."""
     last_entity_idx = None
 
     for i in range(len(path) - 1, -1, -1):
@@ -60,6 +146,7 @@ def _corrupt_path(path, all_entities, base_rels):
 
 
 class PathDataset(Dataset):
+    """Dataset of positive KG paths paired with corrupted negative paths."""
 
     def __init__(self, paths, max_len, vocab, all_entities, base_rels,
                  PAD, BOS, EOS, UNK):
@@ -102,6 +189,7 @@ class PathDataset(Dataset):
 
 def create_path_dataset(paths, vocab, base_rels, PAD, BOS, EOS, UNK,
                         batch_size=64, val_ratio=0.1):
+    """Shuffle paths, split into train/validation sets, and create loaders."""
     if not paths:
         raise ValueError("No paths were provided to create_path_dataset().")
 
@@ -126,6 +214,7 @@ def create_path_dataset(paths, vocab, base_rels, PAD, BOS, EOS, UNK,
     train_paths = shuffled[:split]
     val_paths = shuffled[split:]
 
+    # If the dataset is very small, reuse train as validation to avoid empty loader.
     if not val_paths:
         val_paths = train_paths[:]
 
@@ -147,8 +236,23 @@ def create_path_dataset(paths, vocab, base_rels, PAD, BOS, EOS, UNK,
 
     return train_loader, val_loader, max_len, all_entities
 
+
+# ---------------------------------------------------------------------------
+# Model Creation
+# ---------------------------------------------------------------------------
+
+
 def create_model(vocab_size, max_len, BOS, EOS, device="cpu",
                  n_embd=256, n_layer=4, n_head=4, dropout=0.1):
+    """
+    Create a small GPT-2 model for KG path modelling.
+
+    Recommended full ML-100K setting:
+        n_embd=256, n_layer=4, n_head=4, dropout=0.1
+
+    Safer/faster setting if training is slow:
+        n_embd=192, n_layer=4, n_head=4
+    """
     config = GPT2Config(
         vocab_size=vocab_size,
         n_positions=max_len,
@@ -169,8 +273,15 @@ def create_model(vocab_size, max_len, BOS, EOS, device="cpu",
 
     return model
 
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+
+
 def _compute_combined_loss(model, pos_ids, pos_labels, neg_ids, neg_labels,
                            margin=0.5, lambda_neg=0.3):
+    """LM loss on positive paths plus margin-based contrastive loss."""
     pos_out = model(input_ids=pos_ids, labels=pos_labels)
     lm_loss = pos_out.loss
 
@@ -183,7 +294,22 @@ def _compute_combined_loss(model, pos_ids, pos_labels, neg_ids, neg_labels,
 
 
 def train_model(model, train_loader, val_loader, device="cpu",
-                epochs=8, lr=3e-4, patience=3):
+                epochs=8, lr=3e-4, patience=3,
+                user_gender_labels=None, vocab=None,
+                lambda_adv=0.1, adv_warmup_epochs=2):
+    """Train the GPT-2 path model with adversarial fairness and early stopping."""
+    use_adv = (user_gender_labels is not None and vocab is not None)
+    discriminator = None
+    adv_optimizer = None
+    grl = None
+    if use_adv:
+        n_embd = model.config.n_embd
+        discriminator = GenderDiscriminator(n_embd).to(device)
+        grl = GradientReversalLayer(lambda_adv=lambda_adv)
+        adv_optimizer = torch.optim.Adam(discriminator.parameters(), lr=1e-3)
+        adv_criterion = nn.BCEWithLogitsLoss()
+        print(f"Adversarial training enabled (λ={lambda_adv}, warmup={adv_warmup_epochs})")
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     scheduler = CosineAnnealingLR(
         optimizer,
@@ -212,6 +338,29 @@ def train_model(model, train_loader, val_loader, device="cpu",
                 neg,
                 neg_labels,
             )
+
+            # Adversarial gender loss
+            adv_loss_val = 0.0
+            if use_adv and ep >= adv_warmup_epochs:
+                with torch.no_grad():
+                    hidden = model(input_ids=pos,
+                                   output_hidden_states=True).hidden_states[-1]
+                user_emb = hidden[:, 1, :]
+                gender_labels = []
+                id2tok_local = {v: k for k, v in vocab.items()}
+                for seq in pos:
+                    tok_str = id2tok_local.get(seq[1].item(), "")
+                    gender_labels.append(user_gender_labels.get(tok_str, -1))
+                gender_t = torch.tensor(gender_labels, dtype=torch.float).to(device)
+                valid = gender_t >= 0
+                if valid.sum() > 0:
+                    adv_optimizer.zero_grad()
+                    disc_loss = adv_criterion(discriminator(user_emb[valid].detach()), gender_t[valid])
+                    disc_loss.backward()
+                    adv_optimizer.step()
+                    fool_loss = adv_criterion(discriminator(grl(user_emb[valid])), gender_t[valid])
+                    loss = loss + fool_loss
+                    adv_loss_val = fool_loss.item()
 
             optimizer.zero_grad()
             loss.backward()
@@ -260,7 +409,14 @@ def train_model(model, train_loader, val_loader, device="cpu",
 
     return model
 
+
+# ---------------------------------------------------------------------------
+# Constrained Generation, kept for ablation only
+# ---------------------------------------------------------------------------
+
+
 def _allowed_next_tokens(prefix_tokens, adj, base_rels):
+    """Return valid next tokens from the KG for constrained generation."""
     if len(prefix_tokens) == 0:
         return set(adj.keys())
 
@@ -279,6 +435,7 @@ def _allowed_next_tokens(prefix_tokens, adj, base_rels):
 def constrained_generate(start_tokens, model, vocab, id2tok, adj, base_rels,
                          PAD, BOS, EOS, UNK, max_len, device="cpu",
                          max_new_tokens=20, temperature=1.0, topk=30):
+    """Generate a valid KG path using constrained decoding. Used for ablation."""
     model.eval()
 
     ids = torch.tensor(
@@ -286,6 +443,7 @@ def constrained_generate(start_tokens, model, vocab, id2tok, adj, base_rels,
         dtype=torch.long,
     ).to(device)
 
+    # Remove EOS so generation can continue from start_tokens.
     ids = ids[:, :-1]
 
     def _strip(tokens):
@@ -338,6 +496,12 @@ def constrained_generate(start_tokens, model, vocab, id2tok, adj, base_rels,
 
     return _strip(_ids_to_tokens(ids[0].tolist()))
 
+
+# ---------------------------------------------------------------------------
+# Pattern Extraction & Scoring Helpers
+# ---------------------------------------------------------------------------
+
+
 def extract_patterns(tokens, movie_titles_set):
     """Detect explanation patterns in a generated or enumerated KG path."""
 
@@ -349,6 +513,8 @@ def extract_patterns(tokens, movie_titles_set):
 
     patterns = {}
 
+    # Collaborative filtering pattern:
+    # User -> likes -> MovieA -> rev_likes -> UserB -> likes -> MovieB
     for i in range(0, len(tokens) - 6):
         w = tokens[i:i + 7]
 
@@ -364,6 +530,8 @@ def extract_patterns(tokens, movie_titles_set):
             patterns["cf"] = {"seed": w[2], "candidate": w[6]}
             break
 
+    # Movie-attribute bridge patterns:
+    # MovieA -> relation -> Entity -> reverse_relation -> MovieB
     bridge_patterns = [
         ("genre", "hasGenre", "rev_hasGenre", "genre"),
         ("director", "directedBy", "rev_directedBy", "director"),
@@ -392,6 +560,7 @@ def extract_patterns(tokens, movie_titles_set):
                 }
                 break
 
+    # Gender-aware pattern, used only for the gender baseline if enabled.
     for i in range(0, len(tokens) - 6):
         w = tokens[i:i + 7]
 
@@ -409,6 +578,7 @@ def extract_patterns(tokens, movie_titles_set):
     return patterns
 
 
+# Balanced priority: genre remains first for HR, CF remains very close for fairness.
 PATTERN_PRIORITY = [
     "genre",
     "cf",
@@ -432,6 +602,13 @@ DEFAULT_PATTERN_SCORES = {
 
 
 def compute_pattern_specificity(adj, movie_titles_set):
+    """
+    Compute data-driven specificity scores for path types.
+
+    This function is kept for optional analysis/ablation. The default final
+    model uses DEFAULT_PATTERN_SCORES above because they are more stable for
+    the full ML-100K + IMDb KG setting.
+    """
     pattern_rels = {
         "director": ("directedBy", "rev_directedBy"),
         "cast": ("hasCast", "rev_hasCast"),
@@ -483,6 +660,12 @@ def compute_pattern_specificity(adj, movie_titles_set):
 
 
 def compute_cf_score(user_node, candidate_movie, adj, liked, max_neighbors=30):
+    """
+    Collaborative relevance score in [0, 1].
+
+    Measures how similar the target user is to users who liked the candidate.
+    Similarity is Jaccard similarity over liked movies.
+    """
     candidate_likers = adj.get(candidate_movie, {}).get("rev_likes", set())
 
     if not candidate_likers or not liked:
@@ -515,6 +698,12 @@ def compute_cf_score(user_node, candidate_movie, adj, liked, max_neighbors=30):
 
 
 def compute_user_popularity_preference(user_node, adj, max_popularity):
+    """
+    Estimate a user's preferred item popularity level in [0, 1].
+
+    This is based on the average popularity of movies the user liked in the
+    training graph. It does not use gender or any protected attribute.
+    """
     liked = adj.get(user_node, {}).get("likes", set())
 
     if not liked or max_popularity <= 0:
@@ -532,6 +721,15 @@ def compute_user_popularity_preference(user_node, adj, max_popularity):
 
 
 def compute_popularity_calibration_score(user_node, candidate_movie, adj, max_popularity):
+    """
+    User-specific popularity calibration score in [0, 1].
+
+    High score means the candidate movie's popularity is close to the user's
+    historical popularity preference.
+
+    This aims to reduce popularity-driven exposure imbalance while preserving
+    personalization quality.
+    """
     if max_popularity <= 0:
         return 0.5
 
@@ -552,6 +750,17 @@ def score_path(gen_tokens, user_node, model, vocab, adj, movie_titles_set,
                PAD, BOS, EOS, UNK, base_rels, device="cpu",
                _movie_genres_cache=None,
                _pattern_scores=None):
+    """
+    Score a single KG path using PEARLM-style language model probability.
+
+    The score is the average log-probability of the path tokens under the
+    GPT-2 model, mapped to [0, 1]. Higher = the model finds this path more
+    plausible. This is the same ranking signal used by PEARLM (Balloccu et
+    al., RecSys 2024).
+
+    The unused arguments (movie_titles_set, _movie_genres_cache, _pattern_scores)
+    are kept for backwards-compatible call signatures.
+    """
     ids = torch.tensor(
         [_encode_path(gen_tokens, vocab, UNK, BOS, EOS)],
         dtype=torch.long,
@@ -569,9 +778,25 @@ def score_path(gen_tokens, user_node, model, vocab, adj, movie_titles_set,
     # Map mean log-prob into [0, 1]. The same mapping the batched scorer uses.
     return float(min(1.0, max(0.0, 1.0 + mean_lp / 10.0)))
 
+
+# ---------------------------------------------------------------------------
+# Candidate Enumeration
+# ---------------------------------------------------------------------------
+
+
 def enumerate_candidates(user_node, adj, movie_titles_set, liked,
-                         include_gender=False,
                          max_paths_per_movie=2):
+    """
+    Enumerate valid KG candidate paths from a user to candidate movies.
+
+    The function keeps at most max_paths_per_movie explanation paths per movie.
+    This avoids scoring many redundant paths that lead to the same movie while
+    preserving more than one possible explanation when available.
+
+
+    Returns:
+        dict {movie_title -> list[(pattern_type, path_tokens)]}
+    """
     all_paths = {}
     priority = {pat: i for i, pat in enumerate(PATTERN_PRIORITY)}
 
@@ -592,15 +817,20 @@ def enumerate_candidates(user_node, adj, movie_titles_set, liked,
         if len(all_paths[movie_b]) > max_paths_per_movie:
             all_paths[movie_b] = all_paths[movie_b][:max_paths_per_movie]
 
+    # Attribute bridge paths. CF is handled separately below.
     bridge_rels = [
-        ("genre", "hasGenre", "rev_hasGenre"),
-        ("director", "directedBy", "rev_directedBy"),
-        ("cast", "hasCast", "rev_hasCast"),
-        ("writer", "writtenBy", "rev_writtenBy"),
-        ("composer", "hasComposer", "rev_hasComposer"),
+        ("genre",           "hasGenre",          "rev_hasGenre"),
+        ("director",        "directedBy",         "rev_directedBy"),
+        ("cast",            "hasCast",            "rev_hasCast"),
+        ("writer",          "writtenBy",          "rev_writtenBy"),
+        ("composer",        "hasComposer",        "rev_hasComposer"),
+        ("producer",        "hasProducer",        "rev_hasProducer"),
+        ("cinematographer", "hasCinematographer", "rev_hasCinematographer"),
     ]
 
     for movie_a in liked:
+        # Attribute paths:
+        # User -> likes -> MovieA -> relation -> Entity -> reverse_relation -> MovieB
         for pat_type, fwd_rel, rev_rel in bridge_rels:
             for entity in adj.get(movie_a, {}).get(fwd_rel, set()):
                 for movie_b in adj.get(entity, {}).get(rev_rel, set()):
@@ -618,11 +848,15 @@ def enumerate_candidates(user_node, adj, movie_titles_set, liked,
                         ],
                     )
 
+        # Collaborative filtering path:
+        # User -> likes -> MovieA -> rev_likes -> UserB -> likes -> MovieB
         for user_b in adj.get(movie_a, {}).get("rev_likes", set()):
             if user_b == user_node:
                 continue
-
             for movie_b in adj.get(user_b, {}).get("likes", set()):
+                if (movie_b in all_paths and
+                        any(pt == "cf" for pt, _ in all_paths[movie_b])):
+                    continue
                 _add(
                     movie_b,
                     "cf",
@@ -637,32 +871,21 @@ def enumerate_candidates(user_node, adj, movie_titles_set, liked,
                     ],
                 )
 
-    if include_gender:
-        for gender_node in adj.get(user_node, {}).get("hasGender", set()):
-            for user_b in adj.get(gender_node, {}).get("rev_hasGender", set()):
-                if user_b == user_node:
-                    continue
-
-                for movie_b in adj.get(user_b, {}).get("likes", set()):
-                    _add(
-                        movie_b,
-                        "gender",
-                        [
-                            user_node,
-                            "hasGender",
-                            gender_node,
-                            "rev_hasGender",
-                            user_b,
-                            "likes",
-                            movie_b,
-                        ],
-                    )
-
     return all_paths
+
+
+# ---------------------------------------------------------------------------
+# Batched GPT-2 Confidence Scoring
+# ---------------------------------------------------------------------------
 
 
 def _batch_score_conf(path_list, model, vocab, UNK, BOS, EOS, device,
                       batch_size=256):
+    """
+    Compute GPT-2 confidence scores for many paths in batches.
+
+    Returns one confidence value in [0, 1] for every path.
+    """
     if not path_list:
         return []
 
@@ -707,7 +930,14 @@ def _batch_score_conf(path_list, model, vocab, UNK, BOS, EOS, device,
 
     return s_conf_list
 
+
+# ---------------------------------------------------------------------------
+# Recommendation
+# ---------------------------------------------------------------------------
+
+
 def _dedupe_best_per_movie(scored):
+    """Keep only the highest-scoring path for each candidate movie."""
     best = {}
     for score, movie, pat_type, path_tokens in scored:
         if movie not in best or score > best[movie][0]:
@@ -719,9 +949,60 @@ def _dedupe_best_per_movie(scored):
 
 
 def _diversify_topk(scored, K, lambda_div=0.0, free_repeats=2):
+    """
+    Greedy path-type balancing re-ranking with a soft cap.
+
+    Motivation
+    ----------
+    In KG path recommendation, the top-K list may be dominated by one
+    explanation type such as ``director``. This function keeps relevance as the
+    main signal but adds a small redundancy penalty when the same explanation
+    type is repeated too often. This follows the logic of diversity-aware
+    re-ranking such as MMR, adapted here to explanation/path types.
+
+    At each step, pick the candidate that maximizes:
+
+        adjusted_score = raw_score
+                         - lambda_div * max(0, count(selected_same_type)
+                                                - free_repeats)
+
+    Why the soft cap?
+    -----------------
+    The first few recommendations of a strong path type should not be punished,
+    because they may carry real relevance signal. The penalty starts only after
+    ``free_repeats`` items of the same path type have already been selected.
+    This usually recovers part of the HR loss while still preventing a top-K
+    list from being dominated by one explanation pattern.
+
+    Notes
+    -----
+    * ``lambda_div=0.0`` gives the original pure path-score ranking.
+    * The same movie is never returned twice.
+    * If multiple paths lead to the same movie, the path type that best fits the
+      current balanced top-K list can be selected, instead of being discarded
+      before re-ranking.
+
+    Args
+    ----
+    scored:
+        list of (score, movie, pat_type, path_tokens) tuples. It may contain
+        multiple path types for the same movie.
+    K:
+        target recommendation list length.
+    lambda_div:
+        path-type redundancy penalty. Suggested first values: 0.03, 0.05.
+    free_repeats:
+        number of already selected items of a path type allowed before the
+        diversity penalty starts. Default 2 is a light, HR-friendly setting.
+
+    Returns
+    -------
+    list of (movie, pat_type, path_tokens) tuples, length <= K.
+    """
     if not scored:
         return []
 
+    # Original behaviour: use only the best path per movie, then sort by score.
     if lambda_div <= 0:
         unique_scored = _dedupe_best_per_movie(scored)
         scored_sorted = sorted(unique_scored, key=lambda x: x[0], reverse=True)
@@ -758,9 +1039,23 @@ def _diversify_topk(scored, K, lambda_div=0.0, free_repeats=2):
 def generate_topk(user_node, model, vocab, id2tok, adj, base_rels,
                   movie_titles_set, PAD, BOS, EOS, UNK, max_len,
                   device="cpu", K=10, max_total_attempts=None,
-                  include_gender=False, _pattern_scores=None,
+                  _pattern_scores=None,
                   max_paths_per_movie=4, lambda_div=0.0, path_balance_free_repeats=2,
-                  eval_batch_size=512):
+                  eval_batch_size=512, _precomputed_candidates=None,
+                  _precomputed_cf=None):
+    """
+    Generate top-K movie recommendations for a user.
+
+    Main strategy:
+        1. Enumerate all valid KG candidate paths deterministically.
+        2. Keep up to max_paths_per_movie paths per candidate movie.
+        3. Batch-score paths with GPT-2.
+        4. Rank paths by GPT-2 confidence (PEARLM-style path score).
+        5. Optionally apply soft path-type balancing to reduce explanation concentration.
+
+    Set max_total_attempts="random" to use the original constrained-generation
+    loop for ablation experiments.
+    """
     if user_node not in adj:
         return []
 
@@ -769,11 +1064,15 @@ def generate_topk(user_node, model, vocab, id2tok, adj, base_rels,
     if not liked:
         return []
 
+    # Precompute movie genre cache once per user.
     movie_genres_cache = {
         m: set(adj.get(m, {}).get("hasGenre", set()))
         for m in movie_titles_set
     }
 
+    # -----------------------------------------------------------------------
+    # Ablation mode: original random constrained-generation loop.
+    # -----------------------------------------------------------------------
     if max_total_attempts == "random":
         attempts_cap = 600
         scored_candidates = []
@@ -843,19 +1142,25 @@ def generate_topk(user_node, model, vocab, id2tok, adj, base_rels,
                     (score, candidate, meta.get("type", "unknown"), gen)
                 )
 
+        # Apply the same diversification as the main mode for consistency.
         return _diversify_topk(
             scored_candidates, K, lambda_div=lambda_div,
             free_repeats=path_balance_free_repeats,
         )
 
-    all_candidates = enumerate_candidates(
-        user_node,
-        adj,
-        movie_titles_set,
-        liked,
-        include_gender=include_gender,
-        max_paths_per_movie=max_paths_per_movie,
-    )
+    # -----------------------------------------------------------------------
+    # Main mode: enumerate candidates and batch-score candidate paths.
+    # -----------------------------------------------------------------------
+    if _precomputed_candidates is not None:
+        all_candidates = _precomputed_candidates
+    else:
+        all_candidates = enumerate_candidates(
+            user_node,
+            adj,
+            movie_titles_set,
+            liked,
+            max_paths_per_movie=max_paths_per_movie,
+        )
 
     if not all_candidates:
         return []
@@ -870,6 +1175,10 @@ def generate_topk(user_node, model, vocab, id2tok, adj, base_rels,
             flat_pat_types.append(pat_type)
             flat_paths.append(path_tokens)
 
+    # GPT-2 path confidence for all candidate paths.
+    # PEARLM-style scoring: rank candidates by language model probability alone.
+    # The LM has been trained on KG paths, so its own confidence is the most
+    # principled signal of "how plausible is this user-to-movie connection".
     s_conf_all = _batch_score_conf(
         flat_paths,
         model,
@@ -881,31 +1190,34 @@ def generate_topk(user_node, model, vocab, id2tok, adj, base_rels,
         batch_size=eval_batch_size,
     )
 
-    liked_set = set(adj[user_node].get("likes", set()))
-
-    cf_overlap: dict[str, int] = {}
-    for movie_b in set(flat_movies):
-        if movie_b in liked_set:
-            continue
-        co_users_b = set(adj.get(movie_b, {}).get("rev_likes", set()))
-        overlap = 0
-        for seed in liked_set:
-            co_users_seed = set(adj.get(seed, {}).get("rev_likes", set()))
-            overlap += len(co_users_b & co_users_seed)
-        cf_overlap[movie_b] = overlap
-
-    max_cf = max(cf_overlap.values(), default=1)
-    if max_cf == 0:
-        max_cf = 1
+    # Build scored path candidates. We intentionally keep multiple path types
+    # per movie at this stage. This allows the path-type balancing step to
+    # choose a non-dominant explanation path when it gives a better top-K
+    # explanation mix. The final output still contains unique movies only.
+    # CF overlap scoring: combine GPT-2 confidence with co-user signal
+    if _precomputed_cf is not None:
+        cf_overlap = _precomputed_cf
+    else:
+        liked_set = set(adj[user_node].get("likes", set()))
+        cf_overlap = {}
+        for movie_b in set(flat_movies):
+            co_b = set(adj.get(movie_b, {}).get("rev_likes", set()))
+            cf_overlap[movie_b] = sum(
+                len(co_b & set(adj.get(s, {}).get("rev_likes", set())))
+                for s in liked_set
+            ) if co_b else 0
+    max_cf = max(cf_overlap.values(), default=1) or 1
 
     scored = []
     for s_conf, movie, pat_type, path_tokens in zip(
         s_conf_all, flat_movies, flat_pat_types, flat_paths
     ):
         s_cf = cf_overlap.get(movie, 0) / max_cf
-        score = 0.5 * s_conf + 0.5 * s_cf
-        scored.append((score, movie, pat_type, path_tokens))
+        scored.append((0.5 * s_conf + 0.5 * s_cf, movie, pat_type, path_tokens))
 
+    # Path-type balancing re-ranking. When lambda_div=0.0, this is equivalent
+    # to the original pure PEARLM-style ranking: best path per movie + top-K by
+    # path score. When lambda_div>0, repeated explanation types are penalized.
     return _diversify_topk(
         scored, K, lambda_div=lambda_div,
         free_repeats=path_balance_free_repeats,

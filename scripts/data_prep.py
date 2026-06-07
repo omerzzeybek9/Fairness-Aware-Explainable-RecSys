@@ -1,3 +1,15 @@
+"""
+data_prep.py - Data loading and preprocessing for KG recommendation.
+
+Supports both MovieLens 100K and 1M datasets.
+
+Functions:
+    load_ml100k(data_dir)   -> ratings, movies, users
+    load_ml1m(data_dir)     -> ratings, movies, users
+    subset_data(...)        -> ratings_sub, movies_sub, users_sub, positive_interactions, user_info
+    train_test_split(...)   -> train_interactions, test_interactions, user_item_edges, test_set_dict
+"""
+
 import pandas as pd
 
 GENRE_COLS = [
@@ -6,7 +18,13 @@ GENRE_COLS = [
     "Mystery", "Romance", "SciFi", "Thriller", "War", "Western",
 ]
 
+
+# ---------------------------------------------------------------------------
+# Data Loading
+# ---------------------------------------------------------------------------
+
 def load_ml100k(data_dir="ml-100k"):
+    """Load MovieLens 100K dataset."""
     ratings = pd.read_csv(
         f"{data_dir}/u.data", sep="\t",
         names=["userId", "movieId", "rating", "timestamp"],
@@ -30,6 +48,7 @@ def load_ml100k(data_dir="ml-100k"):
 
 
 def load_ml1m(data_dir="ml-1m"):
+    """Load MovieLens 1M dataset."""
     ratings = pd.read_csv(
         f"{data_dir}/ratings.dat", sep="::", engine="python",
         names=["userId", "movieId", "rating", "timestamp"],
@@ -42,6 +61,7 @@ def load_ml1m(data_dir="ml-1m"):
         f"{data_dir}/users.dat", sep="::", engine="python",
         names=["userId", "gender", "age", "occupation", "zip"],
     )
+    # Add binary genre columns
     for g in GENRE_COLS:
         movies[g] = movies["genres"].str.contains(g, case=False).astype(int)
 
@@ -50,9 +70,20 @@ def load_ml1m(data_dir="ml-1m"):
     return ratings, movies, users
 
 
+# ---------------------------------------------------------------------------
+# Subset Selection
+# ---------------------------------------------------------------------------
+
 def subset_data(ratings, movies, users,
                 max_users=200, max_movies=250, like_threshold=4,
                 balance_gender=False):
+    """
+    Select the most active users and most-rated movies, then filter to
+    positive interactions (rating >= like_threshold).
+
+    Args:
+        balance_gender: if True, take equal M/F users (max_users // 2 each)
+    """
     user_activity = ratings.groupby("userId").size().sort_values(ascending=False)
 
     if balance_gender:
@@ -89,8 +120,31 @@ def subset_data(ratings, movies, users,
     return ratings_sub, movies_sub, users_sub, positive_interactions, user_info
 
 
+# ---------------------------------------------------------------------------
+# Train / Test Split
+# ---------------------------------------------------------------------------
+
 def train_test_split(positive_interactions, movies_sub, test_ratio=0.2,
                      kg_movie_titles=None):
+    """
+    Temporal train/test split per user (last test_ratio fraction -> test).
+
+    Args:
+        positive_interactions : DataFrame of positive ratings
+        movies_sub            : DataFrame of movies in the subset
+        test_ratio            : fraction of each user's interactions to hold out
+        kg_movie_titles       : optional set of movie titles present in the KG.
+                                If provided, test ground truths are filtered to
+                                only include movies the model can actually recommend.
+                                Movies not in the KG cannot be enumerated by the
+                                model, so keeping them would unfairly lower HR.
+
+    Returns:
+        train_interactions : DataFrame
+        test_interactions  : DataFrame
+        user_item_edges    : list of ("User_<id>", "likes", "movie_title") triples
+        test_set_dict      : dict {"User_<id>" -> [movie_title, ...]}
+    """
     movie_id_to_label = dict(zip(movies_sub["movieId"], movies_sub["title"]))
     valid_movie_ids = set(movies_sub["movieId"])
 
@@ -103,9 +157,13 @@ def train_test_split(positive_interactions, movies_sub, test_ratio=0.2,
 
     for uid, group in interactions.groupby("userId"):
         n = len(group)
+        # Need at least 2 interactions: 1 for train, 1 for test.
+        # Users with only 1 interaction cannot have both a training signal
+        # and a held-out test item — skip them entirely.
         if n < 2:
             skipped_users += 1
             continue
+        # Ensure at least 1 item in train and 1 in test.
         split_idx = max(1, min(int(n * (1 - test_ratio)), n - 1))
         train_list.append(group.iloc[:split_idx])
         test_list.append(group.iloc[split_idx:])
@@ -132,10 +190,13 @@ def train_test_split(positive_interactions, movies_sub, test_ratio=0.2,
     for row in test_interactions.itertuples(index=False):
         user_node = f"User_{int(row.userId)}"
         movie = movie_id_to_label[int(row.movieId)]
+        # Only include test movies the model can actually recommend.
+        # If kg_movie_titles is provided, filter out movies not in the KG.
         if kg_movie_titles is not None and movie not in kg_movie_titles:
             continue
         test_set_dict.setdefault(user_node, []).append(movie)
 
+    # Remove users whose entire test set was filtered out.
     test_set_dict = {u: mvs for u, mvs in test_set_dict.items() if mvs}
 
     print(f"\nTrain edges: {len(user_item_edges)}")
