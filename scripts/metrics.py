@@ -7,8 +7,7 @@ Sections:
     3. ILAP fairness metrics         — DF, VU, AU, UU, OU, NU, KS, GCE
     4. Additional fairness metrics   — HR gap, Demographic Parity,
                                        Counterfactual Fairness
-    5. Path fairness metrics         — path type distribution, cross-genre access,
-                                       path length fairness, path score KS
+    5. Path fairness metrics         — path diversity, Fu et al. SIGIR 2020 metrics
 """
 
 import math
@@ -587,34 +586,6 @@ def path_diversity_summary(results, k=10):
     }
 
 
-def path_type_distribution(results, gender_map, disadv="F", adv="M", k=None):
-    """
-    For each gender group, compute the fraction of recommendation explanation
-    path types (genre/director/cf/cast/writer) in the top-K list.
-
-    Important: this uses ``result['pattern_types']`` instead of raw path[1],
-    because raw paths usually begin with ``likes`` and would hide the actual
-    explanation type.
-    """
-    rel_counts = {"M": Counter(), "F": Counter()}
-
-    for res in results:
-        g = gender_map.get(res["user"])
-        if g not in ("M", "F"):
-            continue
-        pts = res.get("pattern_types", [])
-        if k is not None:
-            pts = pts[:k]
-        rel_counts[g].update([pt for pt in pts if pt])
-
-    dist = {}
-    for g in ("M", "F"):
-        total = sum(rel_counts[g].values())
-        dist[g] = {rel: count / total
-                   for rel, count in rel_counts[g].items()} if total else {}
-
-    return dist
-
 
 def print_path_diversity_report(results, k=10, label="Model"):
     """Print overall explanation path diversity for a result list."""
@@ -631,137 +602,6 @@ def print_path_diversity_report(results, k=10, label="Model"):
     for typ, cnt in summary['counts'].most_common():
         print(f"    {typ:<12} {cnt:>6} ({cnt / total * 100:>5.1f}%)")
 
-
-def cross_genre_access(results, gender_map, adj, genre_key="hasGenre",
-                        k=10, disadv="F", adv="M"):
-    """
-    Among users who both like at least one Action/Drama/etc. movie in training,
-    compare the fraction whose top-K recommendations include movies of that genre.
-
-    This tests proxy bias: do female Action fans get Action recommendations
-    as often as male Action fans?
-
-    Args:
-        results:    list of dicts with 'user', 'top_k_recs'
-        gender_map: dict user_node → 'M'|'F'
-        adj:        KG adjacency (to get user's liked genres)
-
-    Returns:
-        DataFrame-like list of dicts per genre:
-            {genre, access_M, access_F, gap, gap_direction}
-    """
-    # Build: genre → {user_node → has_genre_in_liked_movies}
-    genre_to_users = defaultdict(lambda: {"M": [], "F": []})
-
-    for res in results:
-        u = res["user"]
-        g = gender_map.get(u)
-        if g not in ("M", "F"):
-            continue
-        liked_movies  = adj[u].get("likes", set())
-        liked_genres  = set()
-        for movie in liked_movies:
-            liked_genres |= adj[movie].get(genre_key, set())
-
-        top_k_genres = set()
-        for movie in res["top_k_recs"][:k]:
-            top_k_genres |= adj.get(movie, {}).get(genre_key, set())
-
-        genre_to_users["__all__"][g].append(
-            {"user": u, "liked_genres": liked_genres, "rec_genres": top_k_genres}
-        )
-
-    # Collect all genres seen in liked movies
-    all_genres = set()
-    for g in ("M", "F"):
-        for entry in genre_to_users["__all__"][g]:
-            all_genres |= entry["liked_genres"]
-
-    rows = []
-    for genre in sorted(all_genres):
-        counts = {"M": {"users": 0, "got_rec": 0},
-                  "F": {"users": 0, "got_rec": 0}}
-        for g in ("M", "F"):
-            for entry in genre_to_users["__all__"][g]:
-                if genre in entry["liked_genres"]:
-                    counts[g]["users"] += 1
-                    if genre in entry["rec_genres"]:
-                        counts[g]["got_rec"] += 1
-
-        access_m = (counts["M"]["got_rec"] / counts["M"]["users"]
-                    if counts["M"]["users"] > 0 else 0.0)
-        access_f = (counts["F"]["got_rec"] / counts["F"]["users"]
-                    if counts["F"]["users"] > 0 else 0.0)
-        gap = access_m - access_f
-
-        rows.append({
-            "genre":          genre,
-            "users_M":        counts["M"]["users"],
-            "users_F":        counts["F"]["users"],
-            "access_M":       round(access_m, 4),
-            "access_F":       round(access_f, 4),
-            "gap_M_minus_F":  round(gap, 4),
-        })
-
-    rows.sort(key=lambda x: abs(x["gap_M_minus_F"]), reverse=True)
-    return rows
-
-
-def path_length_fairness(results, gender_map, disadv="F", adv="M"):
-    """
-    Compare average recommendation path length between gender groups.
-
-    Longer paths = weaker evidence = less confident recommendations.
-    A gap here means the KG has sparser coverage of one group's preferences.
-
-    Returns:
-        dict {gender: {'mean_len', 'std_len', 'n'}}
-    """
-    lengths = {"M": [], "F": []}
-
-    for res in results:
-        g = gender_map.get(res["user"])
-        if g not in ("M", "F"):
-            continue
-        for path in res.get("paths", []):
-            lengths[g].append(len(path))
-
-    out = {}
-    for g in ("M", "F"):
-        arr = lengths[g]
-        out[g] = {
-            "mean_len": float(np.mean(arr))   if arr else 0.0,
-            "std_len":  float(np.std(arr))    if arr else 0.0,
-            "n":        len(arr),
-        }
-    out["gap"] = abs(out["M"]["mean_len"] - out["F"]["mean_len"])
-    return out
-
-
-def path_score_ks(results, gender_map, disadv="F", adv="M"):
-    """
-    KS test on per-user average path score distributions by gender.
-
-    A significant KS stat means the model assigns systematically
-    different confidence scores to one gender's recommendations.
-
-    Returns: (ks_stat, p_value)
-    """
-    scores = {"M": [], "F": []}
-
-    for res in results:
-        g = gender_map.get(res["user"])
-        if g not in ("M", "F"):
-            continue
-        user_scores = [s for _, _, s in res.get("recs_with_scores", [])]
-        if user_scores:
-            scores[g].append(float(np.mean(user_scores)))
-
-    if not scores["M"] or not scores["F"]:
-        return 0.0, 1.0
-
-    ks_stat, p_val = scipy_stats.ks_2samp(scores[adv], scores[disadv])
-    return float(ks_stat), float(p_val)
 
 
 def _sid_score(pattern_types, k=None):
@@ -885,8 +725,8 @@ def compute_path_fairness_metrics(results, gender_map, k=10,
 
 def print_path_fairness_report(results, gender_map,
                                results_baseline=None,
-                               label="GPT-2 (Ours)",
-                               label_baseline="GPT-2 + Gender",
+                               label="APEX (Ours)",
+                               label_baseline="APEX + Gender",
                                k=10):
     """
     Print path-level fairness report using Fu et al. (SIGIR 2020) metrics.

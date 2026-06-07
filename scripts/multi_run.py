@@ -160,7 +160,7 @@ def run(adj, all_users, test_set_dict, movie_titles_set,
 def report(all_runs, k_values=(1, 3, 5, 10)):
     """
     Print mean ± std for all metrics and run t-tests against the
-    GPT-2+Gender baseline (if provided in all_runs as 'gender_runs').
+    APEX+Gender baseline (if provided in all_runs as 'gender_runs').
 
     Parameters
     ----------
@@ -243,16 +243,16 @@ def report(all_runs, k_values=(1, 3, 5, 10)):
 
 def compare(our_runs, gender_runs, k=10):
     """
-    Paired t-test: GPT-2 (Ours) vs GPT-2+Gender across seeds.
+    Paired t-test: APEX (Ours) vs APEX+Gender across seeds.
 
     Parameters
     ----------
     our_runs    : list of run dicts from run() for our model
-    gender_runs : list of run dicts from run() for GPT-2+Gender
+    gender_runs : list of run dicts from run() for APEX+Gender
     k           : cutoff value
     """
     print("\n" + "="*60)
-    print("  STATISTICAL COMPARISON: GPT-2 (Ours) vs GPT-2+Gender")
+    print("  STATISTICAL COMPARISON: APEX (Ours) vs APEX+Gender")
     print("="*60)
 
     metrics = {

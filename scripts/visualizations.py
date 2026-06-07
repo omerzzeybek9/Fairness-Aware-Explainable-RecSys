@@ -7,8 +7,10 @@ Usage (in notebook):
     importlib.reload(viz)
 
     models = {
-        "GPT-2 (Ours)": (results,        ranking_metrics,        group_metrics),
-        "GPT-2+Gender": (results_gender,  ranking_metrics_gender, group_metrics_gender),
+        "APEX (Ours)": (results, ranking_metrics, group_metrics),
+        "UserCF":      (results_ucf, ranking_metrics_ucf, group_metrics_ucf),
+        "SVD-MF":      (results_svd, ranking_metrics_svd, group_metrics_svd),
+        "MLP-CF":      (results_mlp, ranking_metrics_mlp, group_metrics_mlp),
     }
 
     viz.plot_all(models, k_values=K_VALUES, save_dir="figures")
@@ -23,8 +25,8 @@ from metrics import evaluate_ranking, disparate_impact
 # ── Style ──────────────────────────────────────────────────────────────────────
 
 MODEL_COLORS = {
-    "GPT-2 (Ours)":  "#2ecc71",
-    "GPT-2+Gender":  "#e74c3c",
+    "APEX (Ours)":  "#2ecc71",
+    "APEX+Gender":  "#e74c3c",
 }
 
 GENDER_COLORS = {"M": "#3498db", "F": "#e74c3c"}
